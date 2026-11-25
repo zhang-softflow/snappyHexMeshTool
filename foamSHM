@@ -1,0 +1,2424 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 foamSHM contributors
+#
+# foamSHM is free software: you can redistribute it and/or modify it under the
+# terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version. See the LICENSE file for details.
+"""
+foamSHM - Browse, search, generate and check OpenFOAM snappyHexMeshDict settings.
+
+The database is a keyword dictionary of snappyHexMeshDict built from
+  - the annotated dictionary  etc/caseDicts/annotated/snappyHexMeshDict
+    (including the commented-out optional entries) and etc/caseDicts/meshQualityDict,
+  - the C++ sources that read the dictionary (get / getOrDefault /
+    readIfPresent / found ...), which give mandatory/optional and defaults,
+  - the Enum name tables (allowed values),
+  - the searchableSurface types (geometry 'type') and their header docs,
+  - every snappyHexMeshDict found in the tutorials (real usage).
+
+Keyword paths use placeholders for user-defined names, e.g.
+    castellatedMeshControls/refinementSurfaces/<surface>/level
+
+Sub-commands:
+    build     Scan the sources and write the database
+    tree      Show the dictionary structure (mandatory/optional, defaults)
+    search    Full-text search in keywords and descriptions
+    show      Show description, default, choices, sources and usage of a keyword
+              or of a geometry type (box, cylinder, triSurfaceMesh, ...)
+    example   Print real usage taken from the tutorials
+    template  Generate a ready-to-edit snappyHexMeshDict
+    check     Check an existing snappyHexMeshDict (typos, missing entries,
+              geometry names, surface files, locationInMesh)
+    html      Generate the stand-alone catalog.html
+
+Database lookup order:
+    1. $FOAMSHM_DB
+    2. ${XDG_DATA_HOME:-~/.local/share}/foamSHM/shmDatabase-<version>.json,
+       where <version> is the basename of $WM_PROJECT_DIR (written by 'build')
+    3. shmDatabase.json bundled next to this script
+"""
+
+import argparse
+import difflib
+import gzip
+import json
+import os
+import re
+import shutil
+import sys
+from datetime import date
+from pathlib import Path
+
+__version__ = "1.0.0"
+
+TOOL_DIR = Path(__file__).resolve().parent
+BUNDLED_DB = TOOL_DIR / "shmDatabase.json"
+HTML_FILE = TOOL_DIR / "catalog.html"
+HTML_TEMPLATE = TOOL_DIR / "catalog_template.html"
+
+ANNOTATED = "etc/caseDicts/annotated/snappyHexMeshDict"
+QUALITY_DICT = "etc/caseDicts/meshQualityDict"
+CFG_DICTS = [
+    ("etc/caseDicts/mesh/generation/snappyHexMeshDict.cfg", ""),
+    ("etc/caseDicts/mesh/generation/meshQualityDict.cfg", "meshQualityControls"),
+]
+SEARCHABLE_DIRS = ["src/meshTools/searchableSurfaces",
+                   "src/parallel/distributed/distributedTriSurfaceMesh"]
+MOVER_DIR = "src/mesh/snappyHexMesh/externalDisplacementMeshMover"
+SKIP_DIRS = {"lnInclude", "platforms", "Make", "build"}
+
+# Section paths
+CMC = "castellatedMeshControls"
+SC = "snapControls"
+ALC = "addLayersControls"
+MQC = "meshQualityControls"
+RS = CMC + "/refinementSurfaces/<surface>"
+RR = CMC + "/refinementRegions/<name>"
+LR = CMC + "/limitRegions/<name>"
+GEO = "geometry/<geometry>"
+
+TOP_SECTIONS = ["geometry", CMC, SC, ALC, MQC]
+
+# Dictionaries whose sub-entries are user-chosen names -> placeholder
+NAMED = {
+    "geometry": "<geometry>",
+    GEO + "/regions": "<region>",
+    CMC + "/refinementSurfaces": "<surface>",
+    RS + "/regions": "<region>",
+    CMC + "/refinementRegions": "<name>",
+    RR + "/regions": "<region>",
+    CMC + "/limitRegions": "<name>",
+    CMC + "/faceZoneControls": "<faceZone>",
+    ALC + "/layers": "<patch>",
+}
+# Lists whose items are dictionaries
+LIST_DICTS = {CMC + "/features"}
+
+# Entries common to all geometry types (read by searchableSurfaces)
+GEOM_COMMON = {"type", "name", "regions"}
+
+# Dictionaries whose content is not checked (passed to other classes)
+FREE_RE = re.compile(r"^(\w+Coeffs|patchInfo|formatOptions)$")
+
+# Source files that read snappyHexMeshDict, and which dictionary variable
+# corresponds to which (generic) path.
+SCAN = [
+    ("applications/utilities/mesh/generation/snappyHexMesh/snappyHexMesh.C",
+     {"meshDict": "", "refineDict": CMC}),
+    ("src/meshTools/searchableSurfaces/searchableSurfaces/searchableSurfaces.C",
+     {"dict": GEO, "regionDict": GEO + "/regions/<region>"}),
+    ("src/mesh/snappyHexMesh/snappyHexMeshDriver/refinementParameters/refinementParameters.C",
+     {"dict": CMC, "fzDict": CMC + "/faceZoneControls/<faceZone>"}),
+    ("src/mesh/snappyHexMesh/refinementSurfaces/refinementSurfaces.C",
+     {"dict": RS, "regionDict": RS + "/regions/<region>"}),
+    ("src/mesh/snappyHexMesh/refinementSurfaces/surfaceZonesInfo.C",
+     {"surfacesDict": RS}),
+    ("src/mesh/snappyHexMesh/shellSurfaces/shellSurfaces.C",
+     {"dict": [RR, LR], "regionDict": RR + "/regions/<region>"}),
+    ("src/mesh/snappyHexMesh/refinementFeatures/refinementFeatures.C",
+     {"dict": CMC + "/features/{}"}),
+    ("src/mesh/snappyHexMesh/snappyHexMeshDriver/snapParameters/snapParameters.C",
+     {"dict": SC}),
+    ("src/mesh/snappyHexMesh/snappyHexMeshDriver/snappySnapDriverBufferLayers.C",
+     {"snapDict": SC}),
+    ("src/mesh/snappyHexMesh/snappyHexMeshDriver/layerParameters/layerParameters.C",
+     {"dict": ALC, "layerDict": ALC + "/layers/<patch>"}),
+    ("src/mesh/snappyHexMesh/externalDisplacementMeshMover/medialAxisMeshMover.C",
+     {"coeffDict": ALC, "moveDict": ALC, "meshQualityDict": ALC}),
+    ("src/mesh/snappyHexMesh/externalDisplacementMeshMover/displacementMotionSolverMeshMover.C",
+     {"moveDict": ALC, "dict": ALC}),
+    ("src/mesh/snappyHexMesh/meshRefinement/meshRefinementProblemCells.C",
+     {"motionDict": MQC}),
+    ("src/mesh/snappyHexMesh/snappyHexMeshDriver/snappyLayerDriver.C",
+     {"motionDict": MQC}),
+    ("src/dynamicMesh/motionSmoother/motionSmootherAlgoCheck.C",
+     {"dict": MQC}),
+    ("src/dynamicMesh/motionSmoother/motionSmootherAlgo.C",
+     {"paramDict": MQC, "paramDict_": MQC}),
+]
+ENUM_FILES = [
+    "src/mesh/snappyHexMesh/meshRefinement/meshRefinement.C",
+    "src/mesh/snappyHexMesh/refinementSurfaces/surfaceZonesInfo.C",
+    "src/mesh/snappyHexMesh/shellSurfaces/shellSurfaces.C",
+    "src/mesh/snappyHexMesh/snappyHexMeshDriver/layerParameters/layerParameters.C",
+]
+
+# Keywords that are filled in internally by the code (never by the user)
+INTERNAL_KEYS = {"minThicknessName"}
+
+# Keyword -> Enum table, where the word is read first and converted later
+ENUM_LINKS = {
+    "cellZoneInside": "areaSelectionAlgoNames",
+    "faceZoneNaming": "faceZoneNamingNames",
+    "faceType": "faceZoneTypeNames",
+    "thicknessModel": "thicknessModelTypeNames_",
+    "debugFlags": "debugTypeNames",
+    "writeFlags": "writeTypeNames",
+}
+# Allowed values that are not in an Enum table of the scanned files
+EXTRA_CHOICES = {
+    "gapMode": ["inside", "outside", "mixed"],   # volumeType names
+}
+
+# Mandatory flag corrections, with an explanation (the code reads these
+# conditionally, which a pattern scan cannot see)
+REQ_OVERRIDE = {
+    CMC + "/locationInMesh": ("cond", "Either locationInMesh or locationsInMesh is needed."),
+    CMC + "/locationsInMesh": ("cond", "Either locationInMesh or locationsInMesh is needed."),
+    CMC + "/features/{}/level": ("cond", "Use either 'level' (old) or 'levels' (distance-level pairs)."),
+    CMC + "/features/{}/levels": ("cond", "Use either 'level' (old) or 'levels' (distance-level pairs)."),
+    RS + "/insidePoint": ("cond", "Needed when cellZoneInside is insidePoint (or use insidePoints)."),
+    RS + "/insidePoints": ("cond", "Alternative to insidePoint when cellZoneInside is insidePoint."),
+    RS + "/faceZone": ("no", "Optional; also required for faceZoneNaming single."),
+    RS + "/regions/<region>/perpendicularAngle": ("no", ""),
+    RR + "/nSmoothExpansion": ("cond", "Needed when smoothDirection is given."),
+    RR + "/nSmoothPosition": ("cond", "Needed when smoothDirection is given."),
+    LR + "/nSmoothExpansion": ("cond", "Needed when smoothDirection is given."),
+    LR + "/nSmoothPosition": ("cond", "Needed when smoothDirection is given."),
+    SC + "/solver": ("cond", "Needed for type castellatedBufferLayer (motion solver used to inflate the buffer layer)."),
+    ALC + "/solver": ("cond", "Needed when meshShrinker is displacementMotionSolver."),
+    ALC + "/firstLayerThickness": ("cond", "Depends on thicknessModel (or which two of the thickness entries are given)."),
+    ALC + "/finalLayerThickness": ("cond", "Depends on thicknessModel (or which two of the thickness entries are given)."),
+    ALC + "/thickness": ("cond", "Depends on thicknessModel (or which two of the thickness entries are given)."),
+    ALC + "/expansionRatio": ("cond", "Depends on thicknessModel (or which two of the thickness entries are given)."),
+    MQC + "/relaxed": ("cond", "Used by layer addition after nRelaxedIter iterations; needed when addLayers is true."),
+}
+
+# Search synonyms (English and Japanese) -> keyword paths
+ALIASES = {
+    ALC: "boundary layer prism inflation wall layer 境界層 プリズム層 レイヤー 壁面 層",
+    ALC + "/layers/<patch>/nSurfaceLayers": "number of layers 層数 境界層 レイヤー",
+    ALC + "/firstLayerThickness": "first cell height yplus y+ 第一層 第1層 最初の層 厚さ",
+    ALC + "/expansionRatio": "growth rate stretching 拡大率 成長率 膨張率",
+    ALC + "/thicknessModel": "layer thickness specification 層 厚さ 指定方法",
+    ALC + "/relativeSizes": "relative absolute 相対 絶対 厚さ",
+    ALC + "/featureAngle": "layer corner sharp edge 角 エッジ 層 止まる",
+    CMC + "/refinementSurfaces": "surface refinement level 表面 細分化 リファイン レベル 解像度 細かく",
+    RS + "/level": "surface refinement level min max 細分化 レベル",
+    CMC + "/refinementRegions": "region volume box refinement 領域 細分化 リファイン 局所",
+    RR + "/levels": "distance inside outside level 距離 内側 外側 レベル",
+    RR + "/mode": "inside outside distance 内側 外側 距離",
+    RR + "/levelIncrement": "directional anisotropic 方向 異方性 一方向",
+    CMC + "/features": "feature edge line eMesh 特徴線 エッジ 稜線",
+    SC + "/explicitFeatureSnap": "feature edge snapping eMesh 特徴線 スナップ エッジ",
+    SC + "/implicitFeatureSnap": "feature edge snapping 特徴線 スナップ 自動",
+    CMC + "/locationInMesh": "keep point inside fluid region seed 内部点 流体側 残す 点",
+    CMC + "/locationsInMesh": "multi region cellZone 複数領域 マルチリージョン 点",
+    RS + "/faceZone": "zone baffle interface ゾーン 面ゾーン バッフル",
+    RS + "/cellZone": "zone porous MRF region セルゾーン ゾーン 多孔質 回転領域",
+    RS + "/cellZoneInside": "zone inside outside ゾーン 内側 外側",
+    RS + "/faceType": "baffle internal boundary バッフル 内部面 境界",
+    RS + "/patchInfo": "patch type wall patch 境界 パッチ 種類 タイプ",
+    RS + "/gapLevel": "gap narrow thin 隙間 狭い ギャップ",
+    RR + "/gapLevel": "gap narrow thin 隙間 狭い ギャップ",
+    RS + "/curvatureLevel": "curvature 曲率",
+    RS + "/blockLevel": "gap thin remove 隙間 削除 閉塞",
+    CMC + "/maxGlobalCells": "cell count limit セル数 上限",
+    CMC + "/maxLocalCells": "cell count limit processor セル数 上限 並列",
+    CMC + "/nCellsBetweenLevels": "transition buffer 遷移 バッファ レベル間",
+    CMC + "/resolveFeatureAngle": "feature angle refinement 特徴角 角度",
+    CMC + "/limitRegions": "limit refinement 細分化 制限 上限",
+    SC: "snap snapping 吸着 スナップ フィット",
+    SC + "/tolerance": "snap distance 距離 許容",
+    MQC: "mesh quality non-orthogonality skewness メッシュ品質 非直交 歪み スキュー",
+    MQC + "/maxNonOrtho": "non-orthogonality 非直交",
+    MQC + "/minTetQuality": "tet quality layer テトラ 品質",
+    "mergeTolerance": "tolerance merge 許容誤差",
+    "geometry": "stl obj surface shape searchable 形状 ジオメトリ 面",
+    "addLayers": "boundary layer switch 境界層 切り替え",
+    "snap": "switch スナップ 切り替え",
+    "castellatedMesh": "switch 切り替え",
+    "type": "buffer layer castellatedBufferLayer バッファ層",
+}
+GEOM_ALIASES = {
+    "box": "rectangle cuboid 箱 直方体 立方体",
+    "rotatedBox": "rotated box 回転 箱 直方体",
+    "cylinder": "pipe tube 円柱 円筒 管",
+    "sphere": "ball 球",
+    "plane": "infinite plane 平面",
+    "plate": "rectangle finite plane 板 平板",
+    "disk": "circle 円板",
+    "cone": "frustum 円錐 円錐台",
+    "triSurfaceMesh": "stl obj vtk file surface 形状 ファイル",
+    "extrudedCircle": "tube along curve 曲線 管",
+}
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def is_foam_root(path):
+    return path is not None and Path(path, "src", "OpenFOAM").is_dir()
+
+
+def project_dir(arg=None, required=True):
+    """Return the OpenFOAM root (explicit argument, $WM_PROJECT_DIR, or two
+    levels above this script)."""
+    if arg:
+        cands = [Path(arg)]
+    else:
+        cands = []
+        env = os.environ.get("WM_PROJECT_DIR")
+        if env:
+            cands.append(Path(env))
+        cands.append(TOOL_DIR.parent.parent)
+    for c_ in cands:
+        if is_foam_root(c_) or Path(c_, "etc", "caseDicts").is_dir():
+            return c_.resolve()
+    if required:
+        sys.exit("Error: OpenFOAM tree not found. Source the OpenFOAM "
+                 "environment (etc/bashrc) or use --src <OpenFOAM root>.")
+    return None
+
+
+def user_db_path(version):
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "foamSHM" / f"shmDatabase-{version}.json"
+
+
+def current_version():
+    env = os.environ.get("WM_PROJECT_DIR")
+    return Path(env).name if env else None
+
+
+def read_text(path):
+    try:
+        path = Path(path)
+        if path.suffix == ".gz":
+            with gzip.open(path, "rt", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def blank_comments(text):
+    """Replace C/C++ comments by blanks, keeping newlines (line numbers)."""
+    def rep(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+    text = re.sub(r'"(?:[^"\\\n]|\\.)*"|/\*.*?\*/|//[^\n]*',
+                  lambda m: m.group(0) if m.group(0).startswith('"') else rep(m),
+                  text, flags=re.S)
+    return text
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+# --- doxygen header parsing (same format as foamFO / foamFV) ---------------
+
+SECTION_RE = re.compile(r"^([A-Z][A-Za-z ]{1,30})\s*$")
+LINK_RE = re.compile(r"\\link\s+([\w.]+)\s+\\endlink")
+
+
+def header_comment(text):
+    m = re.search(r"\\\*-{5,}[-*]*\*/", text)
+    if not m:
+        return ""
+    block = text[: m.start()]
+    idx = block.find("\nClass")
+    if idx < 0:
+        idx = block.find("\nDescription")
+    return block[idx + 1:] if idx >= 0 else block
+
+
+def split_sections(comment):
+    sections = {}
+    current = None
+    buf = []
+
+    def flush():
+        if current:
+            old = sections.get(current)
+            txt = "\n".join(buf)
+            sections[current] = old + "\n\n" + txt if old else txt
+    for line in comment.splitlines():
+        m = SECTION_RE.match(line)
+        if m and not line.startswith(" "):
+            flush()
+            current = m.group(1).strip()
+            buf = []
+        elif current:
+            buf.append(line)
+    flush()
+    return sections
+
+
+def dedent(text):
+    lines = text.splitlines()
+    ind = [len(l) - len(l.lstrip()) for l in lines if l.strip()]
+    cut = min(ind) if ind else 0
+    return "\n".join(l[cut:] for l in lines).strip("\n")
+
+
+def extract_verbatims(text):
+    out = []
+    for part in re.split(r"\\verbatim[ \t]*\n", text)[1:]:
+        end = part.find("\\endverbatim")
+        out.append(dedent(part[:end] if end >= 0 else part))
+    return out
+
+
+def clean_doxygen(text):
+    text = re.sub(r"\\verbatim.*?\\endverbatim", "", text, flags=re.S)
+    text = re.sub(r"\\table.*?\\endtable", "", text, flags=re.S)
+    text = re.sub(r"\\heading\s+[^\n]*", "", text)
+    text = LINK_RE.sub(r"\1", text)
+    text = re.sub(r"\\(c|a|b|em|p)\s+", "", text)
+    text = text.replace("\\<", "<").replace("\\>", ">")
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return dedent(text)
+
+
+def parse_tables(text):
+    tables = []
+    for m in re.finditer(r"(?:\\heading\s+([^\n]*)\n\s*)?\\table\s*\n(.*?)\\endtable",
+                         text, re.S):
+        body = m.group(2).replace("\\<", "<").replace("\\>", ">")
+        lines = [l.strip() for l in body.splitlines() if "|" in l]
+        if not lines:
+            continue
+        head = [c_.strip().lower() for c_ in lines[0].split("|")]
+        cols = {}
+        for i, h in enumerate(head):
+            if h.startswith("prop") or h in ("entry", "keyword", "name"):
+                cols.setdefault("name", i)
+            elif h.startswith("desc"):
+                cols.setdefault("desc", i)
+            elif h.startswith("type"):
+                cols.setdefault("type", i)
+            elif h.startswith("req") or h.startswith("mand"):
+                cols.setdefault("reqd", i)
+            elif h.startswith("def") or h.startswith("dflt"):
+                cols.setdefault("default", i)
+        if "name" not in cols:
+            continue
+        rows = []
+        for l in lines[1:]:
+            cells = [c_.strip() for c_ in l.split("|")]
+
+            def cell(key):
+                i = cols.get(key)
+                return cells[i] if i is not None and i < len(cells) else ""
+            name = cell("name")
+            if not name:
+                continue
+            reqd = cell("reqd").lower()
+            if reqd.startswith(("yes", "y")):
+                reqd = "yes"
+            elif reqd.startswith("no"):
+                reqd = "no"
+            elif reqd.startswith(("cnd", "cond")):
+                reqd = "cond"
+            rows.append({"name": name,
+                         "desc": re.sub(r"\s+", " ", LINK_RE.sub(r"\1", cell("desc"))),
+                         "type": cell("type"), "reqd": reqd,
+                         "default": "" if cell("default") in ("-", "") else cell("default")})
+        if rows:
+            tables.append({"heading": (m.group(1) or "").strip(), "rows": rows})
+    return tables
+
+
+# ---------------------------------------------------------------------------
+# OpenFOAM dictionary parser (keeps line numbers and comments)
+# ---------------------------------------------------------------------------
+
+TOKEN_RE = re.compile(r"""
+    (?P<lc>//[^\n]*)
+  | (?P<bc>/\*.*?\*/)
+  | (?P<code>\#\{.*?\#\})
+  | (?P<str>"(?:[^"\\]|\\.)*")
+  | (?P<var>\$\{[^}]*\}|\$[^\s{}();\[\]"]+)
+  | (?P<p>[{}();\[\]])
+  | (?P<w>(?:[^\s{}();\[\]"/]|/(?![/*]))+)
+""", re.S | re.X)
+
+
+def tokenize(text):
+    toks = []
+    for m in TOKEN_RE.finditer(text):
+        kind = m.lastgroup
+        line = line_of_cache(text, m.start())
+        end = line + m.group(0).count("\n")
+        toks.append((kind, m.group(0), line, end))
+    return toks
+
+
+_LINE_CACHE = {}
+
+
+def line_of_cache(text, pos):
+    key = id(text)
+    starts = _LINE_CACHE.get(key)
+    if starts is None or starts[0] is not text:
+        idx = [0]
+        for m in re.finditer("\n", text):
+            idx.append(m.end())
+        starts = (text, idx)
+        _LINE_CACHE.clear()
+        _LINE_CACHE[key] = starts
+    import bisect
+    return bisect.bisect_right(starts[1], pos)
+
+
+def clean_comment(text):
+    if text.startswith("/*"):
+        text = text[2:-2]
+        lines = [re.sub(r"^\s*\*?\s?", "", l) for l in text.splitlines()]
+    else:
+        lines = [re.sub(r"^(?:\s*//[-/]*)+\s?", "", text)]
+    return [l.rstrip() for l in lines]
+
+
+def join_value(parts):
+    s = " ".join(parts)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    return s
+
+
+class DictParser:
+    """Tolerant parser. Entries are dicts:
+        k (key), line, end, t ('dict' | 'value' | 'include' | 'macro'),
+        v (value text), ch (children for 'dict'), items (dicts inside a list),
+        pre (comment lines above), post (trailing comment)
+    """
+
+    def __init__(self, text):
+        self.toks = tokenize(text)
+        self.i = 0
+        self.pending = []
+
+    def peek(self, skip_comments=True):
+        j = self.i
+        while j < len(self.toks):
+            if not (skip_comments and self.toks[j][0] in ("lc", "bc")):
+                return self.toks[j]
+            j += 1
+        return None
+
+    def next(self):
+        """Next significant token; comments are collected in self.pending."""
+        while self.i < len(self.toks):
+            t = self.toks[self.i]
+            self.i += 1
+            if t[0] in ("lc", "bc"):
+                self.pending.append(t)
+                continue
+            return t
+        return None
+
+    def take_pre(self, key_line):
+        """Comments directly above key_line (a contiguous block)."""
+        block = []
+        expect = key_line
+        for t in reversed(self.pending):
+            if t[3] == expect - 1 or (t[3] == expect and t[2] == expect and not block):
+                block.insert(0, t)
+                expect = t[2]
+            else:
+                break
+        self.pending = []
+        out = []
+        for t in block:
+            out.extend(clean_comment(t[1]))
+        return out
+
+    def take_post(self, end_line):
+        j = self.i
+        if j < len(self.toks) and self.toks[j][0] in ("lc", "bc") and self.toks[j][2] == end_line:
+            self.i += 1
+            return " ".join(clean_comment(self.toks[j][1])).strip()
+        return ""
+
+    def parse(self):
+        return self.parse_entries(top=True)
+
+    def parse_entries(self, top=False):
+        entries = []
+        while True:
+            t = self.next()
+            if t is None:
+                return entries
+            kind, txt, line, _ = t
+            if kind == "p":
+                if txt == "}":
+                    if top:
+                        continue
+                    return entries
+                continue          # stray ; ( ) [ ]
+            if kind == "code":
+                continue
+            pre = self.take_pre(line)
+            if kind == "w" and txt.startswith("#"):
+                e = {"k": txt, "line": line, "end": line, "t": "include"
+                     if txt.startswith("#include") else "directive", "v": "", "pre": pre}
+                nt = self.peek()
+                if nt and nt[0] in ("str", "w", "var") and nt[2] == line:
+                    self.next()
+                    e["v"] = nt[1].strip('"')
+                elif nt and nt[1] == "(":
+                    self.read_value()
+                entries.append(e)
+                continue
+            if kind == "var":
+                e = {"k": txt, "line": line, "end": line, "t": "macro", "v": "", "pre": pre}
+                nt = self.peek()
+                if nt and nt[1] == ";":
+                    self.next()
+                entries.append(e)
+                continue
+            key = txt.strip('"') if kind == "str" and not re.search(r"[|.*()\[\]]", txt) else txt
+            nt = self.peek()
+            if nt and nt[1] == "{":
+                self.next()
+                ch = self.parse_entries()
+                end = self.toks[self.i - 1][2] if self.i else line
+                nt2 = self.peek()
+                if nt2 and nt2[1] == ";":
+                    self.next()
+                e = {"k": key, "line": line, "end": end, "t": "dict", "ch": ch, "pre": pre}
+                e["post"] = self.take_post(end)
+                entries.append(e)
+                continue
+            parts, items, end = self.read_value()
+            e = {"k": key, "line": line, "end": end, "t": "value",
+                 "v": join_value(parts), "pre": pre}
+            if items:
+                e["items"] = items
+            e["post"] = self.take_post(end)
+            entries.append(e)
+
+    def read_value(self):
+        parts, items = [], []
+        depth = 0
+        end = self.toks[self.i - 1][2] if self.i else 0
+        while True:
+            t = self.next()
+            if t is None:
+                break
+            kind, txt, line, _ = t
+            end = line
+            if kind == "p":
+                if txt == ";" and depth <= 0:
+                    break
+                if txt == "{":
+                    items.append(self.parse_entries())
+                    parts.append("{...}")
+                    continue
+                if txt == "}":
+                    # Missing ';' before the closing brace: give it back
+                    self.i -= 1
+                    break
+                if txt in "([":
+                    depth += 1
+                elif txt in ")]":
+                    depth -= 1
+            parts.append(txt)
+        self.pending = [p for p in self.pending if p[2] > end]
+        return parts, items, end
+
+
+def parse_dict_text(text):
+    return DictParser(text).parse()
+
+
+def strip_header(entries):
+    return [e for e in entries if e["k"] != "FoamFile"]
+
+
+# --- annotated dictionary: bring back commented-out example entries ---------
+
+STRICT_CODE_RE = re.compile(
+    r'^(?:[A-Za-z_"$#][^\s;]*\s+[^;]*;|[A-Za-z_][\w.]*;|[{}()]\s*;?|\);)$')
+BARE_WORD_RE = re.compile(r'^[A-Za-z_"][\w.:"<>-]*$')
+# Sentences that happen to end with ';' (three words in a row, or quotes)
+PROSE_RE = re.compile(r"'|[A-Za-z]{2,}\s+[A-Za-z]{2,}\s+[A-Za-z]{2,}")
+
+
+def uncomment_examples(text):
+    """Uncomment the lines of commented-out example entries.
+
+    Returns (new text, set of uncommented line numbers). Prose comments are
+    left untouched.
+    """
+    lines = text.split("\n")
+    out = list(lines)
+    flagged = set()
+    paren = 0           # open '(' coming from uncommented lines
+    brace = 0
+
+    def split_comment(l):
+        m = re.match(r"^(\s*)//(.*)$", l)
+        if not m:
+            return None
+        body = m.group(2)
+        nested = body.lstrip().startswith("//")
+        inner = body
+        while inner.lstrip().startswith("//"):
+            inner = inner.lstrip()[2:]
+        code = re.split(r"\s//", " " + inner, maxsplit=1)[0][1:].strip()
+        return m.group(1), body, inner, code, nested
+
+    def next_code(i):
+        for j in range(i + 1, min(i + 4, len(lines))):
+            sc = split_comment(lines[j])
+            if sc is None:
+                return lines[j].strip()
+            if sc[3]:
+                return sc[3]
+        return ""
+
+    for i, l in enumerate(lines):
+        sc = split_comment(l)
+        if sc is None:
+            s = blank_comments(l).strip()
+            paren += s.count("(") - s.count(")")
+            brace += s.count("{") - s.count("}")
+            paren, brace = max(paren, 0), max(brace, 0)
+            continue
+        ind, body, inner, code, nested = sc
+        if not code:
+            continue
+        is_code = bool(STRICT_CODE_RE.match(code)) and not PROSE_RE.search(code)
+        if not is_code and paren > 0 and not nested and not code.startswith("-"):
+            is_code = True
+        if not is_code and BARE_WORD_RE.match(code) and next_code(i) in ("{", "("):
+            is_code = True
+        if not is_code and not code.endswith((".", ",", ":")) and next_code(i) == "(" \
+                and re.match(r"^[A-Za-z_]\w*(\s+\w+)+$", code):
+            is_code = True
+        if is_code:
+            out[i] = ind + inner
+            flagged.add(i + 1)
+            paren += code.count("(") - code.count(")")
+            brace += code.count("{") - code.count("}")
+            paren, brace = max(paren, 0), max(brace, 0)
+    return "\n".join(out), flagged
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+def child_path(parent, key):
+    if parent in NAMED:
+        key = NAMED[parent]
+    elif parent in LIST_DICTS:
+        key = "{}"
+    return f"{parent}/{key}" if parent else key
+
+
+def is_free(path, self_too=False):
+    parts = path.split("/")
+    return any(FREE_RE.match(p) for p in (parts if self_too else parts[:-1]))
+
+
+def walk(entries, parent="", real_parent="", cb=None):
+    """Call cb(generic path, real path, entry) for every entry recursively."""
+    for e in entries:
+        if e["t"] in ("include", "directive", "macro"):
+            cb(parent, real_parent, e)
+            continue
+        path = child_path(parent, e["k"])
+        real = f"{real_parent}/{e['k']}" if real_parent else e["k"]
+        if cb(path, real, e) is False:
+            continue
+        if e["t"] == "dict":
+            walk(e["ch"], path, real, cb)
+        for n, item in enumerate(e.get("items", [])):
+            walk(item, path + "/{}", f"{real}[{n}]", cb)
+
+
+# ---------------------------------------------------------------------------
+# Source scanning
+# ---------------------------------------------------------------------------
+
+TMPL = r"(<(?:[^<>]|<[^<>]*>)*>)?"
+MEMBER_RE = re.compile(
+    r"(\w+)\s*(?:\(\s*\))?\s*(?:\.|->)\s*(getOrDefaultCompat|getOrDefault|getCheckOrDefault|"
+    r"getCheck|getCompat|get|readIfPresentCompat|readIfPresent|readEntry|found|subDict|"
+    r"subOrEmptyDict|optionalSubDict|lookupOrDefault|lookup|isDict|findDict|findEntry)\s*"
+    + TMPL + r"\s*\(")
+FREE_CALL_RE = re.compile(
+    r"(?<![\w.>])(?:meshRefinement::)?(get|subDict|lookup)\s*" + TMPL + r"\s*\(")
+VOLTYPE_RE = re.compile(r'volumeType\s*\(\s*"(\w+)"\s*,\s*(\w+)\s*,\s*([\w:]+)\s*\)')
+ENUM_RE = re.compile(
+    r"Foam::Enum\s*<\s*[\w:]+\s*>\s*(?:[\w:]+::)?(\w+)\s*\(\s*\{(.*?)\}\s*\)", re.S)
+
+REQUIRED_CALLS = {"get", "getCheck", "getCompat", "readEntry", "subDict", "lookup"}
+
+
+def call_args(text, open_pos):
+    """Split the arguments of the call whose '(' is at open_pos."""
+    depth = 0
+    args, cur = [], []
+    i = open_pos
+    in_str = False
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            cur.append(ch)
+            if ch == "\\":
+                cur.append(text[i + 1])
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch in "({[":
+            depth += 1
+            if depth > 1:
+                cur.append(ch)
+        elif ch in ")}]":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return args
+            cur.append(ch)
+        elif ch == "," and depth == 1:
+            args.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    return args
+
+
+def scan_enums(root):
+    enums = {}
+    for rel in ENUM_FILES:
+        txt = blank_comments(read_text(root / rel))
+        for m in ENUM_RE.finditer(txt):
+            pairs = re.findall(r'\{\s*([\w:]+)\s*,\s*"(\w+)"\s*\}', m.group(2))
+            enums[m.group(1)] = {"names": [p[1] for p in pairs],
+                                 "consts": {p[0].split("::")[-1]: p[1] for p in pairs},
+                                 "src": f"{rel}:{line_of(txt, m.start())}"}
+    return enums
+
+
+def scan_movers(root):
+    names = []
+    d = root / MOVER_DIR
+    for f in sorted(d.glob("*.C")):
+        txt = blank_comments(read_text(f))
+        m = re.search(r"addToRunTimeSelectionTable\s*\(\s*externalDisplacementMeshMover\s*,\s*(\w+)", txt)
+        if m:
+            h = read_text(f.with_suffix(".H"))
+            t = re.search(r'TypeName\s*\(\s*"(\w+)"\s*\)', h)
+            names.append(t.group(1) if t else m.group(1))
+    return names
+
+
+DEFAULT_PRETTY = {
+    "labelMin": "labelMin (disabled)",
+    "labelMax": "labelMax (unlimited)",
+    "pointField(0)": "() (none)",
+    "mesh().globalData().nTotalPoints()": "number of mesh points (unlimited)",
+    "coordSetWriters::vtkWriter::typeName": "vtk",
+    "surfaceWriters::vtkWriter::typeName": "vtk",
+    "GREAT": "1e15 (GREAT)",
+    "-GREAT": "-1e15 (-GREAT)",
+    "fileName::null": "\"\" (none)",
+    "vector::zero": "(0 0 0)",
+    "labelPair(0, 0)": "(0 0)",
+    "nullGapLevel": "(0 0 0) (no gap refinement)",
+    "key": "the geometry entry name",
+    "gapLevelIncrement": "castellatedMeshControls/gapLevelIncrement",
+}
+# Per-region values that default to the per-surface value
+SURFACE_DEFAULT_RE = re.compile(r"global\w*\[surfI\]|labelPair\s*\(\s*globalMinLevel")
+
+
+def pretty_default(d, txt, root):
+    """Turn a C++ default expression into something readable."""
+    d = re.sub(r"\s+", " ", d).strip()
+    d = re.sub(r"^(?:Switch|scalar|label|word|bool)\((.*)\)$", r"\1", d)
+    if d in DEFAULT_PRETTY:
+        return DEFAULT_PRETTY[d]
+    if SURFACE_DEFAULT_RE.search(d):
+        return "value of the surface"
+    m = re.fullmatch(r'\w+\.get<\w+>\("(\w+)"\)', d)
+    if m:
+        return f"value of {m.group(1)}"
+    m = re.fullmatch(r"\(?([\d.]+)\s*\*\s*(\w+?)_?\)?", d)
+    if m:
+        return f"{m.group(1)}*{m.group(2)}"
+    if re.fullmatch(r"[a-z]\w*_", d):
+        return f"value of {d[:-1]}"
+    m = re.fullmatch(r"(\w+)::typeName", d)
+    if m:
+        for h in (root / MOVER_DIR).glob(m.group(1) + ".H"):
+            t = re.search(r'TypeName\s*\(\s*"(\w+)"\s*\)', read_text(h))
+            if t:
+                return t.group(1)
+    if re.fullmatch(r"[A-Za-z_]\w*", d) and d not in ("true", "false", "on", "off", "yes", "no"):
+        m = re.search(r"\b" + d + r"\s*=\s*([^;]+);", txt)
+        if m and re.fullmatch(r"[-+\d.eE]+", m.group(1).strip()):
+            return m.group(1).strip()
+    return d
+
+
+def scan_sources(root, enums):
+    """Return {generic path: [read records]} and a list of unmapped reads."""
+    reads = {}
+    unmapped = []
+
+    def add(rel, txt, pos, call, var, key, tmpl, default, enum=None):
+        if key in INTERNAL_KEYS:
+            return
+        mapping = dict(SCAN)[rel]
+        parents = mapping.get(var)
+        ln = line_of(txt, pos)
+        if parents is None:
+            unmapped.append(f"{rel}:{ln} {var}.{call}(\"{key}\")")
+            return
+        if isinstance(parents, str):
+            parents = [parents]
+        for par in parents:
+            path = f"{par}/{key}" if par else key
+            reads.setdefault(path, []).append({
+                "call": call, "file": rel, "line": ln,
+                "type": (tmpl or "").strip("<>").replace(" ", ""),
+                "default": default, "enum": enum,
+                "required": call in REQUIRED_CALLS and default is None,
+            })
+
+    for rel, _ in SCAN:
+        raw = read_text(root / rel)
+        if not raw:
+            continue
+        txt = blank_comments(raw)
+        for m in MEMBER_RE.finditer(txt):
+            var, call, tmpl = m.group(1), m.group(2), m.group(3)
+            args = call_args(txt, m.end() - 1)
+            if not args or not re.fullmatch(r'"\w+"', args[0]):
+                continue
+            key = args[0].strip('"')
+            default = None
+            enum = None
+            if var.endswith(("Names", "Names_")):
+                enum = var
+                dvar = args[1] if len(args) > 1 else ""
+                if call.startswith("getOrDefault") and len(args) > 2:
+                    const = args[2].split("::")[-1]
+                    default = enums.get(var, {}).get("consts", {}).get(const, args[2])
+                var = dvar
+            elif call.startswith(("getOrDefault", "lookupOrDefault", "getCheckOrDefault")):
+                default = pretty_default(args[1], txt, root) if len(args) > 1 else ""
+            add(rel, txt, m.start(), call, var, key, tmpl, default, enum)
+        for m in FREE_CALL_RE.finditer(txt):
+            call, tmpl = m.group(1), m.group(2)
+            args = call_args(txt, m.end() - 1)
+            if len(args) < 2 or not re.fullmatch(r"\w+", args[0]) \
+                    or not re.fullmatch(r'"\w+"', args[1]):
+                continue
+            default = pretty_default(args[4], txt, root) if len(args) > 4 else None
+            add(rel, txt, m.start(), call, args[0], args[1].strip('"'), tmpl, default)
+        for m in VOLTYPE_RE.finditer(txt):
+            add(rel, txt, m.start(), "volumeType", m.group(2), m.group(1), "",
+                m.group(3).split("::")[-1].lower())
+    return reads, unmapped
+
+
+def scan_geometry_types(root):
+    """searchableSurface types registered in the sources."""
+    reg_re = re.compile(
+        r"add(Named)?ToRunTimeSelectionTable\s*\(\s*searchableSurface\s*,\s*(\w+)\s*,\s*\w+\s*"
+        r"(?:,\s*(\w+)\s*)?\)")
+    types = {}
+    for sd in SEARCHABLE_DIRS:
+        for f in sorted((root / sd).rglob("*.C")):
+            if SKIP_DIRS & set(f.parts):
+                continue
+            txt = blank_comments(read_text(f))
+            for m in reg_re.finditer(txt):
+                cls = m.group(2)
+                e = types.setdefault(cls, {"class": cls, "names": [], "file": None})
+                name = m.group(3) if m.group(1) else None
+                if name is None:
+                    h = read_text(f.with_suffix(".H"))
+                    t = re.search(r'TypeName\s*\(\s*"(\w+)"\s*\)', h)
+                    name = t.group(1) if t else cls
+                    e["file"] = f
+                if name not in e["names"]:
+                    e["names"].append(name)
+                e["file"] = e["file"] or f
+    out = {}
+    for cls, e in types.items():
+        names = sorted(e["names"], key=len)
+        short = names[0]
+        hpath = e["file"].with_suffix(".H")
+        hdr = header_comment(read_text(hpath))
+        sec = split_sections(hdr)
+        desc_raw = sec.get("Description", "")
+        usage = sec.get("Usage", "")
+        tables = parse_tables(desc_raw + "\n" + usage)
+        verbs = extract_verbatims(desc_raw + "\n" + usage)
+        desc = clean_doxygen(desc_raw)
+        notes = clean_doxygen(sec.get("Note", ""))
+        out[short] = {
+            "name": short, "names": names, "class": cls,
+            "header": str(hpath.relative_to(root)),
+            "description": desc,
+            "summary": desc.split("\n\n")[0].replace("\n", " ").strip(),
+            "note": notes, "tables": tables, "verbatims": verbs,
+            "aliases": GEOM_ALIASES.get(short, ""),
+            "tutorials": 0, "examples": [], "keys": {},
+        }
+    return out
+
+
+def find_tutorial_dicts(root):
+    tdir = root / "tutorials"
+    files = []
+    for f in sorted(tdir.rglob("snappyHexMeshDict*")):
+        if f.is_file() and not (SKIP_DIRS & set(f.parts)) and not f.name.endswith((".orig~", "~")):
+            files.append(f)
+    return files
+
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+def new_kw(path):
+    parent, _, key = path.rpartition("/")
+    return {"when": [], "path": path, "key": key, "parent": parent, "kind": "", "req": "",
+            "default": "", "type": "", "choices": [], "desc": "", "note": "",
+            "annotated": None, "src": [], "tutorials": 0, "examples": [],
+            "origin": []}
+
+
+def cmd_build(args):
+    root = project_dir(args.src)
+    print(f"Scanning {root} ...")
+    kws = {}
+
+    def kw(path):
+        if path not in kws:
+            kws[path] = new_kw(path)
+        return kws[path]
+
+    # --- C++ reads
+    enums = scan_enums(root)
+    reads, unmapped = scan_sources(root, enums)
+    for path, rs in reads.items():
+        k = kw(path)
+        k["origin"].append("source")
+        req = any(r["required"] for r in rs)
+        opt = any(not r["required"] for r in rs)
+        k["req"] = "cond" if (req and opt) else ("yes" if req else "no")
+        for r in rs:
+            if r["default"] not in (None, "") and not k["default"]:
+                k["default"] = r["default"]
+            if r["type"] and not k["type"]:
+                k["type"] = r["type"]
+            if r["enum"] and not k["choices"]:
+                k["choices"] = enums.get(r["enum"], {}).get("names", [])
+            if r["call"] in ("subDict", "subOrEmptyDict", "optionalSubDict", "isDict", "findDict"):
+                k["kind"] = "dict"
+            k["src"].append(f"{r['file']}:{r['line']} {r['call']}")
+        k["src"] = sorted(set(k["src"]))
+        files = {Path(r["file"]).name for r in rs}
+        when = []
+        if path.startswith(ALC + "/"):
+            when.append("addLayers")
+        if files == {"medialAxisMeshMover.C"}:
+            when.append("medialAxis")
+        if files <= {"motionSmootherAlgo.C"}:
+            when.append("snapOrLayers")
+        k["when"] = when
+
+    # --- annotated dictionaries
+    annotated_real = set()
+    commented_dropped = []
+
+    def take_annotated(entries, rel, flagged, prefix=""):
+        found = []
+
+        def cb(path, real, e):
+            if e["t"] in ("include", "directive", "macro"):
+                return
+            if prefix:
+                path = f"{prefix}/{path}"
+            found.append((path, e, e["line"] in flagged))
+        walk(entries, "", "", cb)
+        return found
+
+    sources = []
+    txt = read_text(root / ANNOTATED)
+    if txt:
+        utxt, flagged = uncomment_examples(txt)
+        sources.append((ANNOTATED, take_annotated(strip_header(parse_dict_text(utxt)),
+                                                  ANNOTATED, flagged)))
+    txt = read_text(root / QUALITY_DICT)
+    if txt:
+        utxt, flagged = uncomment_examples(txt)
+        sources.append((QUALITY_DICT, take_annotated(strip_header(parse_dict_text(utxt)),
+                                                     QUALITY_DICT, flagged, MQC)))
+    for rel, found in sources:
+        for path, e, commented in found:
+            if not commented:
+                annotated_real.add(path)
+    # --- tutorials (real usage)
+    tut_files = find_tutorial_dicts(root)
+    tut_rel = [str(f.relative_to(root)) for f in tut_files]
+    geom = scan_geometry_types(root)
+    gname = {}
+    for g in geom.values():
+        for n in g["names"]:
+            gname[n] = g["name"]
+    tut_paths = {}
+    for fi, f in enumerate(tut_files):
+        entries = strip_header(parse_dict_text(read_text(f)))
+        seen = set()
+
+        def cb(path, real, e, fi=fi, seen=seen):
+            if e["t"] in ("include", "directive", "macro"):
+                return
+            if e["k"].startswith("_"):
+                return False      # user macro variables (skip the subtree)
+            v = e.get("v", "") if e["t"] == "value" else "{...}"
+            tut_paths.setdefault(path, []).append([fi, e["line"], v[:120]])
+            seen.add(path)
+            # geometry type usage
+            if path == GEO and e["t"] == "dict":
+                tv = next((c_["v"] for c_ in e["ch"] if c_["k"] == "type"), "")
+                g = gname.get(tv)
+                if g:
+                    G = geom[g]
+                    G["tutorials"] += 1
+                    if len(G["examples"]) < 30:
+                        G["examples"].append([fi, e["line"], e["end"]])
+                    for c_ in e["ch"]:
+                        if c_["k"] not in GEOM_COMMON:
+                            G["keys"][c_["k"]] = G["keys"].get(c_["k"], 0) + 1
+        walk(entries, "", "", cb)
+
+    def is_geom_param(path):
+        return path.startswith(GEO + "/") and path.split("/")[2] not in GEOM_COMMON
+
+    # merge annotated
+    for rel, found in sources:
+        for path, e, commented in found:
+            if is_geom_param(path):
+                continue
+            confirmed = (path in kws or path in annotated_real or path in tut_paths
+                         or is_free(path, True))
+            if commented and not confirmed:
+                commented_dropped.append(f"{rel}:{e['line']} {path}")
+                continue
+            k = kw(path)
+            if "annotated" not in k["origin"]:
+                k["origin"].append("annotated")
+            desc = "\n".join(l for l in e.get("pre", [])
+                             if l.strip() and not re.fullmatch(r"[~\-=*\s]+", l))
+            post = e.get("post", "")
+            info = {"file": rel, "line": e["line"],
+                    "value": e.get("v", "") if e["t"] == "value" else "",
+                    "commented": commented}
+            if e["t"] == "dict":
+                k["kind"] = "dict"
+            if k["annotated"] is None:
+                k["annotated"] = info
+                k["desc"] = (desc + ("\n" + post if post else "")).strip()
+            else:
+                # keep other example values (e.g. thicknessModel alternatives)
+                vals = k["annotated"].setdefault("alternatives", [])
+                if info["value"] and info["value"] != k["annotated"]["value"] \
+                        and info["value"] not in vals:
+                    vals.append(info["value"])
+                    if desc and k["desc"] and k["annotated"]["value"]:
+                        if not k["desc"].startswith("["):
+                            k["desc"] = f"[{k['annotated']['value']}] " + k["desc"]
+                        k["desc"] += f"\n[{info['value']}] " + desc.replace("\n", " ")
+                if not k["desc"] and (desc or post):
+                    k["desc"] = (desc + ("\n" + post if post else "")).strip()
+                if not commented:
+                    k["annotated"]["commented"] = False
+
+    # merge cfg values
+    for rel, prefix in CFG_DICTS:
+        txt = read_text(root / rel)
+        if not txt:
+            continue
+
+        def cb(path, real, e, rel=rel, prefix=prefix):
+            if e["t"] != "value":
+                return
+            p = f"{prefix}/{path}" if prefix else path
+            if p in kws:
+                kws[p].setdefault("cfg", {"file": rel, "value": e["v"]})
+        walk(strip_header(parse_dict_text(txt)), "", "", cb)
+
+    # merge tutorials
+    tutorial_only = []
+    for path, ex in tut_paths.items():
+        if is_geom_param(path):
+            continue
+        if path not in kws:
+            if path.startswith(MQC + "/relaxed/") and (MQC + "/" + path.split("/")[-1]) in kws:
+                continue
+            k = kw(path)
+            if not is_free(path, True) and not k["key"].startswith("<"):
+                tutorial_only.append(path)
+            k["origin"].append("tutorials")
+        k = kws[path]
+        k["tutorials"] = len({x[0] for x in ex})
+        k["examples"] = ex[:25]
+
+    # structure: make sure all parents exist and are dictionaries
+    for path in list(kws):
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            par = "/".join(parts[:i])
+            p = kw(par)
+            if not p["kind"]:
+                p["kind"] = "dict"
+    for path, k in kws.items():
+        if not k["kind"]:
+            ex = k["examples"]
+            k["kind"] = "dict" if ex and all(x[2] == "{...}" for x in ex) else "value"
+        if path in NAMED:
+            k["kind"] = "named"
+        if path in LIST_DICTS:
+            k["kind"] = "list"
+        if path in REQ_OVERRIDE:
+            k["req"], k["note"] = REQ_OVERRIDE[path]
+        if not k["choices"]:
+            if k["key"] in ENUM_LINKS:
+                k["choices"] = enums.get(ENUM_LINKS[k["key"]], {}).get("names", [])
+            elif k["key"] in EXTRA_CHOICES:
+                k["choices"] = EXTRA_CHOICES[k["key"]]
+        if not k["req"]:
+            k["req"] = "" if ("source" not in k["origin"]) else "no"
+        k["aliases"] = ALIASES.get(path, "")
+        k["free"] = is_free(path, True)
+    # parallel structures share the meaning of their entries
+    borrow = [(ALC + "/layers/<patch>/", ALC + "/"), (RS + "/regions/<region>/", RS + "/"),
+              (LR + "/", RR + "/"), (RR + "/regions/<region>/", RR + "/"),
+              (RS + "/", RR + "/"), (RS + "/regions/<region>/", RR + "/"),
+              (CMC + "/faceZoneControls/<faceZone>/", RS + "/")]
+    for _ in range(2):
+        for path, k in kws.items():
+            if k["desc"]:
+                continue
+            for dst, src in borrow:
+                if path.startswith(dst) and "/" not in path[len(dst):]:
+                    other = kws.get(src + path[len(dst):])
+                    if other and other["desc"] and not other.get("borrowed"):
+                        k["desc"] = other["desc"]
+                        k["borrowed"] = other["path"]
+                        break
+    movers = scan_movers(root)
+    if ALC + "/meshShrinker" in kws:
+        kws[ALC + "/meshShrinker"]["choices"] = movers
+    # placeholders inside a named container are dictionaries, required if
+    # the container is
+    for path, k in kws.items():
+        if k["key"].startswith("<") or k["key"] == "{}":
+            k["kind"] = "dict"
+            k["req"] = ""
+
+    db = {
+        "tool": "foamSHM",
+        "version": root.name,
+        "built": date.today().isoformat(),
+        "named": NAMED,
+        "listDicts": sorted(LIST_DICTS),
+        "topSections": TOP_SECTIONS,
+        "enums": {k: v["names"] for k, v in enums.items()},
+        "tutorialFiles": tut_rel,
+        "keywords": dict(sorted(kws.items())),
+        "geometry": dict(sorted(geom.items(), key=lambda kv: kv[0].lower())),
+    }
+    out = Path(args.output) if args.output else user_db_path(root.name)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(db, indent=1, ensure_ascii=False), encoding="utf-8")
+
+    vals = [k for k in kws.values() if k["kind"] == "value"]
+    print(f"Wrote {out}")
+    if not args.output and current_version() != root.name:
+        print(f"  note: used automatically when $WM_PROJECT_DIR ends with '{root.name}';"
+              f" otherwise set FOAMSHM_DB={out}")
+    print(f"  keyword paths       : {len(kws)} ({len(vals)} values)")
+    print(f"  read in the sources : {sum(1 for k in kws.values() if 'source' in k['origin'])}")
+    print(f"  in annotated dicts  : {sum(1 for k in kws.values() if 'annotated' in k['origin'])}")
+    print(f"  used in tutorials   : {sum(1 for k in kws.values() if k['tutorials'])}"
+          f" (from {len(tut_files)} files)")
+    print(f"  geometry types      : {len(geom)}")
+    print(f"  enum tables         : {len(enums)}")
+    no_src = sorted(p for p in annotated_real if p in kws and "source" not in kws[p]["origin"]
+                    and not is_free(p) and not p.startswith(MQC + "/relaxed/")
+                    and kws[p]["kind"] != "dict" and not kws[p]["key"].startswith("<"))
+    no_ann = sorted(p for p, k in kws.items() if "source" in k["origin"]
+                    and "annotated" not in k["origin"])
+    print(f"  source-only keywords (not in annotated): {len(no_ann)}")
+    print(f"  annotated but no source read found     : {len(no_src)}")
+    print(f"  tutorial-only keywords                 : {len(tutorial_only)}")
+    if args.verbose:
+        def show(title, items):
+            print(f"\n[{title}]")
+            for x in items:
+                print("   ", x)
+        show("source-only (not in annotated)", no_ann)
+        show("annotated, no source read found", no_src)
+        show("tutorial-only (not in sources/annotated)", sorted(tutorial_only))
+        show("commented annotated entries dropped (unconfirmed)", commented_dropped)
+        show("unmapped source reads (other dictionaries)", unmapped)
+
+
+# ---------------------------------------------------------------------------
+# Query commands
+# ---------------------------------------------------------------------------
+
+def find_db():
+    env = os.environ.get("FOAMSHM_DB")
+    if env:
+        if not Path(env).is_file():
+            sys.exit(f"Error: FOAMSHM_DB={env} not found.")
+        return Path(env)
+    ver = current_version()
+    if ver and user_db_path(ver).is_file():
+        return user_db_path(ver)
+    return BUNDLED_DB
+
+
+def load_db():
+    path = find_db()
+    if not path.is_file():
+        sys.exit("Error: database not found. Run 'foamSHM build' first.")
+    db = json.loads(path.read_text(encoding="utf-8"))
+    ver = current_version()
+    if ver and path == BUNDLED_DB and db.get("version") != ver and not os.environ.get("FOAMSHM_QUIET"):
+        print(f"Warning: bundled database is for {db.get('version')}, but the "
+              f"environment is {ver}. Run 'foamSHM build' for an exact match.",
+              file=sys.stderr)
+    return db
+
+
+def use_color():
+    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def c(text, code):
+    return f"\033[{code}m{text}\033[0m" if use_color() else text
+
+
+def req_flag(k):
+    return {"yes": "R", "cond": "C", "no": "o"}.get(k["req"], " ")
+
+
+def short_desc(k, width=70):
+    d = k["desc"] or k["note"]
+    d = re.sub(r"\s+", " ", d).strip()
+    if not d and k["annotated"] and k["annotated"]["value"]:
+        d = "e.g. " + k["annotated"]["value"]
+    return d if len(d) <= width else d[: width - 3] + "..."
+
+
+def when_text(k):
+    out = []
+    if "addLayers" in k.get("when", []):
+        out.append("only read when addLayers is true")
+    if "snapOrLayers" in k.get("when", []):
+        out.append("only read when snap or addLayers is true (mesh motion)")
+    if "medialAxis" in k.get("when", []):
+        out.append("only for the default meshShrinker displacementMedialAxis")
+    return "; ".join(out)
+
+
+def legend():
+    return ("R: mandatory, C: conditional, o: optional (default shown), "
+            "blank: not read directly by snappyHexMesh (documentation/tutorials only)")
+
+
+def children(db, path):
+    kws = db["keywords"]
+    return [k for p, k in kws.items() if k["parent"] == path]
+
+
+def order_key(db, k):
+    ann = k["annotated"]
+    return (0 if ann else 1, ann["line"] if ann else 0, k["key"].lower())
+
+
+def cmd_tree(args):
+    db = load_db()
+    kws = db["keywords"]
+    start = resolve_path(db, args.path) if args.path else ""
+    if start and start not in kws:
+        sys.exit(f"Error: unknown path '{args.path}'.")
+
+    def rec(path, depth):
+        for k in sorted(children(db, path), key=lambda k: order_key(db, k)):
+            if not args.all and not k["req"] and k["kind"] == "value" and not k["annotated"]:
+                continue
+            if k["free"] and not args.all:
+                continue
+            ind = "  " * depth
+            name = k["key"] + ("/" if k["kind"] in ("dict", "named", "list") else "")
+            dflt = f" = {k['default']}" if k["default"] else ""
+            line = f"{ind}{req_flag(k)} {c(name, '1;36')}{dflt}"
+            if k["choices"]:
+                line += c("  [" + "|".join(k["choices"]) + "]", "33")
+            if args.desc and k["kind"] == "value":
+                line += c("   " + short_desc(k, 60), "2")
+            print(line)
+            if args.depth is None or depth + 1 < args.depth:
+                rec(k["path"], depth + 1)
+    if start:
+        k = kws[start]
+        print(f"{req_flag(k)} {c(start, '1;36')}")
+        rec(start, 1)
+    else:
+        rec("", 0)
+    print()
+    print(legend())
+
+
+def resolve_path(db, name):
+    """Accept a full path, a path suffix or a bare keyword."""
+    kws = db["keywords"]
+    name = name.strip("/")
+    if name in kws:
+        return name
+    # allow real names instead of placeholders: geometry/motorBike.obj/type
+    cands = [p for p in kws if p.endswith("/" + name) or p.lower() == name.lower()]
+    if len(cands) == 1:
+        return cands[0]
+    if "/" not in name and cands:
+        return sorted(cands)
+    parts = name.split("/")
+    best = []
+    for p in kws:
+        pp = p.split("/")
+        if len(pp) < len(parts):
+            continue
+        tail = pp[len(pp) - len(parts):]
+        if all(a == b or (b.startswith("<") or b == "{}") for a, b in zip(parts, tail)):
+            exact = sum(a == b for a, b in zip(parts, tail))
+            best.append((-exact, len(pp), p))
+    if best:
+        best.sort()
+        top = [b for b in best if b[:2] == best[0][:2]]
+        if len(top) == 1:
+            return top[0][2]
+        return [b[2] for b in top]
+    return cands or None
+
+
+def lookup_geometry(db, name):
+    low = name.lower()
+    for g in db["geometry"].values():
+        if low in (n.lower() for n in g["names"]) or low == g["class"].lower():
+            return g
+    return None
+
+
+def cmd_search(args):
+    db = load_db()
+    words = [w.lower() for w in args.keywords]
+    hits = []
+    kws = db["keywords"]
+    for p, k in kws.items():
+        if k["key"].startswith("<") or k["key"] == "{}":
+            continue
+        parts = p.split("/")
+        inherited = " ".join(kws.get("/".join(parts[:i]), {}).get("aliases", "")
+                             for i in range(1, len(parts)))
+        hay = " ".join([p, k["desc"], k["note"], k.get("aliases", ""), inherited,
+                        " ".join(k["choices"])]).lower()
+        if all(w in hay for w in words):
+            score = sum(5 for w in words if w in k["key"].lower()) + \
+                sum(3 for w in words if w in k.get("aliases", "").lower()) + \
+                sum(1 for w in words if w in k["desc"].lower()) + \
+                (2 if k["req"] == "yes" else 0) + (1 if k["tutorials"] else 0)
+            hits.append((-score, p))
+    ghits = []
+    for g in db["geometry"].values():
+        hay = " ".join(g["names"] + [g["description"], g["aliases"]]).lower()
+        if all(w in hay for w in words):
+            ghits.append(g)
+    if not hits and not ghits:
+        print("No match. Try English keywords, a section name, or 'foamSHM tree'.")
+        return
+    kws = db["keywords"]
+    for _, p in sorted(hits)[: args.max]:
+        k = kws[p]
+        print(f"{req_flag(k)} {c(p, '1;36')}")
+        d = short_desc(k, 100)
+        if d:
+            print(f"      {d}")
+    if len(hits) > args.max:
+        print(f"... {len(hits) - args.max} more (use -m)")
+    if ghits:
+        print(c("\ngeometry types:", "1"))
+        for g in ghits:
+            print(f"  {c(g['name'], '1;36'):<20} {g['summary'][:90]}")
+    print()
+    print(legend())
+
+
+def tut_name(db, fi):
+    f = db["tutorialFiles"][fi]
+    return re.sub(r"^tutorials/", "", f).replace("/system/snappyHexMeshDict", "")
+
+
+def show_keyword(db, path, args):
+    k = db["keywords"][path]
+    print(c(path, "1;36"))
+    req = {"yes": "mandatory", "cond": "conditional", "no": "optional",
+           "": "not read directly (see note)"}[k["req"]]
+    kind = {"named": "dictionary of user-named entries",
+            "list": "list of dictionaries"}.get(k["kind"], k["kind"])
+    print(f"  {c('kind', '1')}      : {kind}" + (f" ({k['type']})" if k["type"] else ""))
+    print(f"  {c('required', '1')}  : {req}")
+    if k["default"]:
+        print(f"  {c('default', '1')}   : {k['default']}")
+    if k["choices"]:
+        print(f"  {c('choices', '1')}   : {' | '.join(k['choices'])}")
+    if k["note"]:
+        print(f"  {c('note', '1')}      : {k['note']}")
+    if k["req"] in ("yes", "cond") and k.get("when"):
+        print(f"  {c('when', '1')}      : {when_text(k)}")
+    if k["desc"]:
+        src = f" - described at {k['borrowed']}" if k.get("borrowed") else ""
+        print(c(f"\nDescription (annotated snappyHexMeshDict{src}):", "1"))
+        for l in k["desc"].splitlines():
+            print("  " + l)
+    ann = k["annotated"]
+    if ann:
+        tag = " (commented-out example)" if ann["commented"] else ""
+        print(c("\nAnnotated example", "1") + f"{tag}: {ann['file']}:{ann['line']}")
+        if ann["value"]:
+            print(f"  {k['key']} {ann['value']};")
+        for v in ann.get("alternatives", []):
+            print(f"  {k['key']} {v};")
+    if k.get("cfg"):
+        print(c("\netc cfg value", "1") + f": {k['cfg']['file']}: {k['key']} {k['cfg']['value']};")
+    if k["kind"] in ("dict", "named", "list"):
+        ch = sorted(children(db, path), key=lambda x: order_key(db, x))
+        if ch:
+            print(c("\nEntries:", "1"))
+            for x in ch:
+                dflt = f" = {x['default']}" if x["default"] else ""
+                print(f"  {req_flag(x)} {x['key']}{dflt}")
+    if k["src"]:
+        print(c("\nRead in:", "1"))
+        for s in k["src"][:8]:
+            print("  " + s)
+    if k["tutorials"]:
+        print(c(f"\nUsed in {k['tutorials']} tutorial file(s), e.g.:", "1"))
+        seen = set()
+        for fi, ln, v in k["examples"]:
+            if fi in seen:
+                continue
+            seen.add(fi)
+            print(f"  {tut_name(db, fi)}:{ln}  {k['key']} {v};" if v != "{...}"
+                  else f"  {tut_name(db, fi)}:{ln}")
+            if len(seen) >= args.max:
+                break
+    elif "source" in k["origin"]:
+        print(c("\nNot used in any tutorial.", "2"))
+    if path in (GEO, "geometry", GEO + "/type"):
+        print(c("\nGeometry types:", "1"), ", ".join(db["geometry"]))
+        print("  (see 'foamSHM show <type>' for the parameters of each type)")
+
+
+def show_geometry(db, g, args):
+    print(c(f"geometry type: {g['name']}", "1;36") +
+          (f"   (also: {', '.join(n for n in g['names'] if n != g['name'])})"
+           if len(g["names"]) > 1 else ""))
+    print(f"  header: {g['header']}")
+    if g["description"]:
+        print(c("\nDescription:", "1"))
+        for l in g["description"].splitlines():
+            print("  " + l)
+    for t in g["tables"]:
+        print(c("\nParameters" + (f" ({t['heading']})" if t["heading"] else "") + ":", "1"))
+        w = max(len(r["name"]) for r in t["rows"])
+        for r in t["rows"]:
+            req = {"yes": "R", "no": "o", "cond": "C"}.get(r["reqd"], r["reqd"][:3] or " ")
+            d = f" = {r['default']}" if r["default"] else ""
+            print(f"  {req:<3} {r['name']:<{w}}  {r['desc']}{d}")
+    if g["note"]:
+        print(c("\nNote:", "1"))
+        for l in g["note"].splitlines():
+            print("  " + l)
+    for v in g["verbatims"][:2]:
+        print(c("\nExample (header):", "1"))
+        print("  " + v.replace("\n", "\n  "))
+    if g["keys"]:
+        print(c("\nParameters used in tutorials:", "1"),
+              ", ".join(f"{k}({n})" for k, n in sorted(g["keys"].items(), key=lambda kv: -kv[1])))
+    print(c(f"\nUsed {g['tutorials']} time(s) in tutorials.", "1") +
+          (" See 'foamSHM example " + g["name"] + "'." if g["tutorials"] else ""))
+
+
+def cmd_show(args):
+    db = load_db()
+    g = lookup_geometry(db, args.name)
+    p = resolve_path(db, args.name)
+    if isinstance(p, str):
+        show_keyword(db, p, args)
+        if g:
+            print()
+            show_geometry(db, g, args)
+        return
+    if g:
+        show_geometry(db, g, args)
+        return
+    if isinstance(p, list) and p:
+        if len(p) <= 3:
+            for i, x in enumerate(p):
+                if i:
+                    print("\n" + "-" * 72)
+                show_keyword(db, x, args)
+            return
+        print(f"'{args.name}' appears in several places:")
+        for x in p:
+            print("  " + x)
+        return
+    close = difflib.get_close_matches(args.name, {k["key"] for k in db["keywords"].values()},
+                                      n=6, cutoff=0.6)
+    msg = f"Error: unknown keyword or geometry type '{args.name}'."
+    if close:
+        msg += " Did you mean: " + ", ".join(close) + " ?"
+    sys.exit(msg + " Try 'foamSHM search'.")
+
+
+def print_block(path, line, end, max_lines=40):
+    lines = read_text(path).splitlines()
+    block = lines[line - 1: end]
+    if len(block) > max_lines:
+        block = block[:max_lines] + ["    ..."]
+    print("\n".join(block))
+
+
+def block_end(lines, line):
+    """Closing line of the dictionary/list starting at 'line' (1-based)."""
+    depth = 0
+    opened = False
+    for i in range(line - 1, len(lines)):
+        s = blank_comments(lines[i])
+        for ch in s:
+            if ch in "{(":
+                depth += 1
+                opened = True
+            elif ch in "})":
+                depth -= 1
+        if opened and depth <= 0:
+            return i + 1
+        if not opened and s.rstrip().endswith(";"):
+            return i + 1
+    return line
+
+
+def cmd_example(args):
+    db = load_db()
+    root = project_dir(args.src, required=False)
+    g = lookup_geometry(db, args.name)
+    p = resolve_path(db, args.name) if not g else None
+    if isinstance(p, list):
+        p = p[0] if len(p) == 1 else None
+    if g:
+        items = [(fi, ln, end) for fi, ln, end in g["examples"]]
+        title = f"geometry type {g['name']}"
+    elif p:
+        k = db["keywords"][p]
+        items = [(fi, ln, None) for fi, ln, _ in k["examples"]]
+        title = p
+    else:
+        sys.exit(f"Error: unknown keyword or geometry type '{args.name}'.")
+    if not items:
+        print(f"No tutorial uses {title}.")
+        return
+    seen = set()
+    n = 0
+    for fi, ln, end in items:
+        if fi in seen:
+            continue
+        seen.add(fi)
+        rel = db["tutorialFiles"][fi]
+        print(c(f"# {rel}:{ln}", "1;32"))
+        f = root / rel if root else None
+        if f and f.is_file():
+            lines = read_text(f).splitlines()
+            e = end or block_end(lines, ln)
+            print_block(f, ln, e)
+        else:
+            k = db["keywords"].get(p) if p else None
+            v = next((x[2] for x in (k["examples"] if k else []) if x[0] == fi), "")
+            print(f"    {args.name} {v};  (source tree not found: use --src for the full block)")
+        print()
+        n += 1
+        if n >= args.max:
+            break
+
+
+# ---------------------------------------------------------------------------
+# template
+# ---------------------------------------------------------------------------
+
+FOAM_BANNER = r"""/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  {ver:<38}|
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+"""
+FOAM_FOOTER = "\n// ************************************************************************* //\n"
+
+SURFACE_EXT = (".stl", ".obj", ".vtk", ".vtp", ".ftr", ".stlb", ".ac", ".nas", ".gts",
+               ".stl.gz", ".obj.gz", ".vtk.gz", ".ftr.gz")
+
+# Parameter placeholders for the analytic shapes in the template
+SHAPE_PARAMS = {
+    "box": [("min", "(<xmin> <ymin> <zmin>)"), ("max", "(<xmax> <ymax> <zmax>)")],
+    "cylinder": [("point1", "(<x1> <y1> <z1>)"), ("point2", "(<x2> <y2> <z2>)"),
+                 ("radius", "<r>")],
+    "sphere": [("centre", "(<x> <y> <z>)"), ("radius", "<r>")],
+}
+
+
+def surface_dirs(case):
+    return [case / "constant" / "triSurface", case / "constant" / "geometry"]
+
+
+def case_surfaces(case):
+    out = []
+    for d in surface_dirs(case):
+        if d.is_dir():
+            for f in sorted(d.iterdir()):
+                if f.is_file() and f.name.lower().endswith(SURFACE_EXT):
+                    # compressed files are found without the .gz suffix
+                    name = re.sub(r"\.gz$", "", f.name)
+                    if name not in out:
+                        out.append(name)
+    return out
+
+
+def surf_base(fname):
+    b = re.sub(r"\.gz$", "", fname)
+    return b.rsplit(".", 1)[0] if "." in b else b
+
+
+def shape_params(db, gtype):
+    if gtype in SHAPE_PARAMS:
+        return SHAPE_PARAMS[gtype]
+    g = lookup_geometry(db, gtype)
+    rows = [r for t in (g["tables"] if g else []) for r in t["rows"]
+            if r["reqd"] == "yes" and r["name"] != "type"]
+    return [(r["name"], f"<{r['name']}>") for r in rows]
+
+
+def build_template(db, surfaces, shapes, opts):
+    L = []
+    a = L.append
+    lmin, lmax = opts.level
+    layers = opts.layers
+    a("// Generated by foamSHM. Edit the <...> placeholders.")
+    a("// Check with: foamSHM check .   (keywords, names, files, locationInMesh)")
+    a("")
+    a("castellatedMesh true;")
+    a("snap            true;")
+    a(f"addLayers       {'true' if layers else 'false'};")
+    a("")
+    a("geometry")
+    a("{")
+    for f in surfaces:
+        a(f"    {f}")
+        a("    {")
+        a("        type triSurfaceMesh;")
+        a(f"        name {surf_base(f)};")
+        a("    }")
+    for gtype, name in shapes:
+        a(f"    {name}")
+        a("    {")
+        a(f"        type {gtype};")
+        for k, v in shape_params(db, gtype):
+            a(f"        {k:<8} {v};")
+        a("    }")
+    a("}")
+    a("")
+    a("castellatedMeshControls")
+    a("{")
+    a("    maxLocalCells       100000;")
+    a("    maxGlobalCells      2000000;")
+    a("    minRefinementCells  10;")
+    a("    maxLoadUnbalance    0.10;")
+    a("    nCellsBetweenLevels 3;")
+    a("")
+    a("    // Feature edge refinement (run surfaceFeatureExtract first)")
+    a("    features")
+    a("    (")
+    if opts.features:
+        for f in surfaces:
+            a(f"        {{ file \"{surf_base(f)}.eMesh\"; level {lmax}; }}")
+    a("    );")
+    a("")
+    a("    refinementSurfaces")
+    a("    {")
+    for f in surfaces:
+        n = surf_base(f)
+        a(f"        {n}")
+        a("        {")
+        a(f"            level ({lmin} {lmax});")
+        if n in opts.zone:
+            a("            faceZone       " + n + ";")
+            a("            cellZone       " + n + ";")
+            a("            cellZoneInside inside;")
+        else:
+            a("            patchInfo { type wall; }")
+        a("        }")
+    a("    }")
+    a("")
+    a("    resolveFeatureAngle 30;")
+    a("")
+    a("    refinementRegions")
+    a("    {")
+    for gtype, name in shapes:
+        a(f"        {name}")
+        a("        {")
+        a("            mode   inside;")
+        a(f"            levels ((1e15 {lmin}));")
+        a("        }")
+    a("    }")
+    a("")
+    loc = opts.location or "(<x> <y> <z>)"
+    a("    // A point inside the region to keep (never on a face)")
+    if opts.bounds_note:
+        a(f"    // {opts.bounds_note}")
+    a(f"    locationInMesh {loc};")
+    a("    allowFreeStandingZoneFaces true;")
+    a("}")
+    a("")
+    a("snapControls")
+    a("{")
+    a("    nSmoothPatch    3;")
+    a("    tolerance       2.0;")
+    a("    nSolveIter      30;")
+    a("    nRelaxIter      5;")
+    a("    nFeatureSnapIter 10;")
+    a(f"    implicitFeatureSnap    {'false' if opts.features else 'true'};")
+    a(f"    explicitFeatureSnap    {'true' if opts.features else 'false'};")
+    a("    multiRegionFeatureSnap false;")
+    a("}")
+    a("")
+    a("addLayersControls")
+    a("{")
+    a("    relativeSizes       true;")
+    a("")
+    a("    layers")
+    a("    {")
+    if layers:
+        for f in surfaces:
+            a(f"        \"{surf_base(f)}.*\"")
+            a("        {")
+            a(f"            nSurfaceLayers {layers};")
+            a("        }")
+    a("    }")
+    a("")
+    a("    expansionRatio      1.2;")
+    a("    finalLayerThickness 0.5;")
+    a("    minThickness        0.1;")
+    a("    nGrow               0;")
+    a("    featureAngle        60;")
+    a("    slipFeatureAngle    30;")
+    a("    nRelaxIter          3;")
+    a("    nSmoothSurfaceNormals 1;")
+    a("    nSmoothNormals      3;")
+    a("    nSmoothThickness    10;")
+    a("    maxFaceThicknessRatio 0.5;")
+    a("    maxThicknessToMedialRatio 0.3;")
+    a("    minMedialAxisAngle  90;")
+    a("    nBufferCellsNoExtrude 0;")
+    a("    nLayerIter          50;")
+    a("    nRelaxedIter        20;")
+    a("}")
+    a("")
+    a("meshQualityControls")
+    a("{")
+    if opts.include_quality:
+        a("    #include \"meshQualityDict\"")
+    else:
+        a("    maxNonOrtho         65;")
+        a("    maxBoundarySkewness 20;")
+        a("    maxInternalSkewness 4;")
+        a("    maxConcave          80;")
+        a("    minVol              1e-13;")
+        a("    minTetQuality       1e-15;")
+        a("    minArea             -1;")
+        a("    minTwist            0.02;")
+        a("    minDeterminant      0.001;")
+        a("    minFaceWeight       0.05;")
+        a("    minVolRatio         0.01;")
+        a("    minTriangleTwist    -1;")
+    a("")
+    a("    relaxed")
+    a("    {")
+    a("        maxNonOrtho 75;")
+    a("    }")
+    a("")
+    a("    nSmoothScale   4;")
+    a("    errorReduction 0.75;")
+    a("}")
+    a("")
+    a("mergeTolerance 1e-6;")
+    return "\n".join(L) + "\n"
+
+
+def cmd_template(args):
+    db = load_db()
+    case = Path(args.case).resolve()
+    surfaces = list(args.stl or [])
+    shapes = []
+    for spec in args.shape or []:
+        if ":" not in spec:
+            sys.exit(f"Error: --shape expects <type>:<name>, e.g. box:refineBox (got '{spec}')")
+        t, n = spec.split(":", 1)
+        g = lookup_geometry(db, t)
+        if not g:
+            sys.exit(f"Error: unknown geometry type '{t}'. Types: {', '.join(db['geometry'])}")
+        shapes.append((t if t in SHAPE_PARAMS else g["name"], n))
+    if not surfaces:
+        surfaces = case_surfaces(case)
+        if surfaces:
+            print(f"// Using surfaces found in {case}/constant: {' '.join(surfaces)}",
+                  file=sys.stderr)
+    if not surfaces and not shapes:
+        surfaces = ["<surface>.stl"]
+    args.zone = set(args.zone or [])
+    args.bounds_note = ""
+    bb = blockmesh_bounds(case)
+    if bb:
+        args.bounds_note = "blockMesh bounds: min ({} {} {}) max ({} {} {})".format(
+            *[f"{x:g}" for x in bb[0] + bb[1]])
+    text = build_template(db, surfaces, shapes, args)
+    # self-check: every keyword must be known to the database
+    issues = check_entries(db, strip_header(parse_dict_text(text)), Path("."), None,
+                           dict_only=True)
+    bad = [i for i in issues if i[0] in ("ERROR", "WARN") and i[2] == "keyword"]
+    if bad:
+        print("Warning: template uses keywords unknown to the database:", file=sys.stderr)
+        for i in bad:
+            print("   ", i[3], file=sys.stderr)
+    full = FOAM_BANNER.format(ver=db["version"]) + "\n" + text + FOAM_FOOTER
+    if not args.write:
+        print(full, end="")
+        return
+    target = case / "system" / "snappyHexMeshDict"
+    if not (case / "system").is_dir():
+        sys.exit(f"Error: {case}/system not found (use -case <case>).")
+    if target.exists():
+        shutil.copy2(target, target.with_name(target.name + ".bak"))
+        print(f"Backup: {target}.bak")
+    target.write_text(full, encoding="utf-8")
+    print(f"Wrote {target}")
+    left = sorted(set(re.findall(r"<[a-z]\w*>", text)))
+    if left:
+        print("Edit these placeholders:", " ".join(left))
+
+
+# ---------------------------------------------------------------------------
+# check
+# ---------------------------------------------------------------------------
+
+def resolve_include(name, cur_file, case, root):
+    name = name.replace("<system>", str(case / "system")) \
+               .replace("<constant>", str(case / "constant")) \
+               .replace("<case>", str(case))
+    name = os.path.expandvars(name)
+    p = Path(name)
+    if not p.is_absolute():
+        p = cur_file.parent / name
+    return p if p.is_file() else None
+
+
+def load_with_includes(path, case, root, depth=0):
+    """Parse a dictionary file and splice in #include / #includeEtc files.
+
+    Returns (entries, notes). Entries keep 'file' to report locations.
+    Dictionaries with unresolved includes or $macros get 'incomplete'.
+    """
+    notes = []
+    entries = strip_header(parse_dict_text(read_text(path)))
+
+    def splice(ents, cur):
+        out = []
+        incomplete = False
+        for e in ents:
+            e["file"] = str(cur)
+            if e["t"] == "include":
+                inc = None
+                if e["k"] in ("#include", "#includeIfPresent"):
+                    inc = resolve_include(e["v"], cur, case, root)
+                elif e["k"] == "#includeEtc" and root:
+                    cand = root / "etc" / e["v"]
+                    inc = cand if cand.is_file() else None
+                if inc and depth < 8:
+                    sub, n2 = load_with_includes(inc, case, root, depth + 1)
+                    notes.extend(n2)
+                    out.extend(sub)
+                    continue
+                if e["k"] != "#includeIfPresent":
+                    notes.append((e, f"cannot resolve {e['k']} \"{e['v']}\""))
+                    incomplete = True
+                continue
+            if e["t"] == "macro":
+                incomplete = True
+                out.append(e)
+                continue
+            if e["t"] == "dict":
+                e["ch"], inc2 = splice(e["ch"], cur)
+                e["incomplete"] = inc2
+            for n, item in enumerate(e.get("items", [])):
+                e["items"][n], _ = splice(item, cur)
+            out.append(e)
+        return merge_entries(out), incomplete
+
+    entries, inc = splice(entries, path)
+    if inc:
+        entries.insert(0, {"k": "__incomplete__", "t": "marker", "line": 0})
+    return entries, notes
+
+
+def merge_entries(entries):
+    """Later entries override earlier ones; dictionaries are merged."""
+    out = []
+    index = {}
+    for e in entries:
+        k = e["k"]
+        if e["t"] in ("macro", "directive", "include", "marker"):
+            out.append(e)
+            continue
+        if k in index:
+            old = out[index[k]]
+            if old["t"] == "dict" and e["t"] == "dict":
+                old["ch"] = merge_entries(old["ch"] + e["ch"])
+                old["incomplete"] = old.get("incomplete") or e.get("incomplete")
+                continue
+            out[index[k]] = e
+            continue
+        index[k] = len(out)
+        out.append(e)
+    return out
+
+
+def blockmesh_bounds(case):
+    for f in (case / "system" / "blockMeshDict", case / "constant" / "polyMesh" / "blockMeshDict"):
+        if not f.is_file():
+            continue
+        ents = strip_header(parse_dict_text(read_text(f)))
+        d = {e["k"]: e for e in ents}
+        v = d.get("vertices")
+        if not v or v["t"] != "value" or re.search(r"[$#]", v["v"]):
+            return None
+        pts = re.findall(r"\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)", v["v"])
+        if not pts:
+            return None
+        try:
+            pts = [[float(x) for x in p] for p in pts]
+        except ValueError:
+            return None
+        s = 1.0
+        for key in ("scale", "convertToMeters"):
+            if key in d and d[key]["t"] == "value":
+                try:
+                    s = float(d[key]["v"])
+                except ValueError:
+                    return None
+        lo = [min(p[i] for p in pts) * s for i in range(3)]
+        hi = [max(p[i] for p in pts) * s for i in range(3)]
+        return lo, hi
+    return None
+
+
+def known_child_keys(db, path):
+    return {k["key"] for k in children(db, path)}
+
+
+def check_entries(db, entries, case, root, dict_only=False, notes=()):
+    """Return a list of (level, location, category, message)."""
+    kws = db["keywords"]
+    issues = []
+    macros_defined = set()
+
+    def loc(e):
+        f = e.get("file")
+        return f"{Path(f).name}:{e['line']}" if f else f"line {e['line']}"
+
+    def collect_macros(ents):
+        for e in ents:
+            if e["t"] == "dict":
+                collect_macros(e["ch"])
+            macros_defined.add(e["k"])
+    collect_macros(entries)
+
+    for e, msg in notes:
+        issues.append(("INFO", loc(e), "include", msg + " (its entries are not checked)"))
+
+    def suggest(parent, key):
+        cands = known_child_keys(db, parent)
+        close = difflib.get_close_matches(key, cands, n=3, cutoff=0.6)
+        if not close:
+            close = difflib.get_close_matches(key.lower(), [x.lower() for x in cands], n=3,
+                                              cutoff=0.6)
+            close = [x for x in cands if x.lower() in close]
+        return close
+
+    def where_else(key):
+        return sorted({k["parent"] or "(top level)" for k in kws.values()
+                       if k["key"] == key and not k["free"]})
+
+    def check_value(path, e):
+        k = kws.get(path)
+        if not k or not k["choices"] or e["t"] != "value":
+            return
+        v = e["v"].strip('"')
+        if path.endswith("Flags"):
+            vals = re.findall(r"\w+", v)
+        else:
+            vals = [v]
+        for x in vals:
+            if re.fullmatch(r"\w+", x) and x not in k["choices"] and not x.startswith("$"):
+                issues.append(("ERROR", loc(e), "value",
+                               f"{path}: '{x}' is not one of {' | '.join(k['choices'])}"))
+
+    def rec(ents, parent, incomplete):
+        present = set()
+        for e in ents:
+            if e["t"] in ("include", "directive", "macro", "marker"):
+                continue
+            key = e["k"]
+            present.add(key)
+            path = child_path(parent, key)
+            if key in macros_defined and key.startswith("_"):
+                continue
+            if is_free(path, True):
+                continue
+            # geometry type-specific parameters are checked separately
+            if parent == GEO and key not in GEOM_COMMON:
+                continue
+            if parent == MQC + "/relaxed":
+                if (MQC + "/" + key) not in kws:
+                    close = suggest(MQC, key)
+                    issues.append(("WARN", loc(e), "keyword",
+                                   f"unknown mesh-quality keyword '{key}' in relaxed"
+                                   + (f" (did you mean: {', '.join(close)}?)" if close else "")))
+                continue
+            if path not in kws:
+                close = suggest(parent, key)
+                other = where_else(key)
+                msg = f"unknown keyword '{key}' in {parent or 'top level'}"
+                if close:
+                    msg += f" (did you mean: {', '.join(close)}?)"
+                elif other:
+                    msg += f" (it belongs to: {', '.join(other[:3])})"
+                issues.append(("WARN", loc(e), "keyword", msg))
+                continue
+            k = kws[path]
+            if not k["req"] and "source" not in k["origin"] and k["kind"] == "value" \
+                    and "annotated" not in k["origin"]:
+                issues.append(("INFO", loc(e), "keyword",
+                               f"'{path}' is used in tutorials but no read was found in the "
+                               "sources; it may be ignored"))
+            check_value(path, e)
+            if e["t"] == "dict":
+                rec(e["ch"], path, incomplete or e.get("incomplete"))
+            for item in e.get("items", []):
+                rec(item, path + "/{}", incomplete)
+        # missing mandatory entries
+        if incomplete or (parent and parent.split("/")[-1] in ("<region>",)):
+            return
+        if parent.startswith(GEO):
+            return
+        for k in children(db, parent):
+            if k["req"] == "yes" and k["key"] not in present and not k["key"].startswith("<") \
+                    and all(active.get(w, True) for w in k.get("when", [])):
+                if k["kind"] == "dict" and parent == "" and k["key"] not in TOP_SECTIONS:
+                    continue
+                issues.append(("ERROR", f"in {parent or 'top level'}", "missing",
+                               f"mandatory entry '{k['key']}' is missing in "
+                               f"{parent or 'top level'}"
+                               + (f" (default in etc cfg: {k['cfg']['value']})"
+                                  if k.get("cfg") else "")))
+
+    top_incomplete = any(e["t"] == "marker" for e in entries)
+    topv = {e["k"]: e.get("v", "") for e in entries if e["t"] == "value"}
+    add_layers = topv.get("addLayers", "false") in ("true", "on", "yes", "1")
+    alc = next((e for e in entries if e["k"] == ALC and e["t"] == "dict"), None)
+    shrinker = next((x.get("v", "") for x in (alc["ch"] if alc else [])
+                     if x["k"] == "meshShrinker"), "displacementMedialAxis")
+    snap = topv.get("snap", "false") in ("true", "on", "yes", "1")
+    active = {"addLayers": add_layers, "medialAxis": shrinker == "displacementMedialAxis",
+              "snapOrLayers": snap or add_layers}
+    rec(entries, "", top_incomplete)
+
+    # ---- cross checks
+    d = {e["k"]: e for e in entries if e["t"] == "dict"}
+    geom = d.get("geometry")
+    cmc = d.get(CMC)
+    gnames = {}
+    if geom:
+        for e in geom["ch"]:
+            if e["t"] != "dict":
+                continue
+            ch = {x["k"]: x for x in e["ch"]}
+            tval = ch.get("type", {}).get("v", "").strip('"')
+            name = ch.get("name", {}).get("v", e["k"]).strip('"')
+            gnames[name] = (e, tval)
+            g = lookup_geometry(db, tval) if tval else None
+            if not tval:
+                issues.append(("ERROR", loc(e), "geometry", f"geometry '{e['k']}' has no type"))
+                continue
+            if not g:
+                if not tval.startswith("$"):
+                    issues.append(("ERROR", loc(e), "geometry",
+                                   f"geometry '{e['k']}': unknown type '{tval}' "
+                                   f"(types: {', '.join(db['geometry'])})"))
+                continue
+            known = {r["name"] for t in g["tables"] for r in t["rows"]} | set(g["keys"]) \
+                | GEOM_COMMON
+            # parameters of other surfaces wrapped by this type
+            if g["name"] in ("searchableSurfaceWithGaps", "searchableSurfaceCollection",
+                             "subTriSurfaceMesh", "distributedTriSurfaceMesh"):
+                known = None
+            for x in e["ch"]:
+                if x["t"] in ("include", "directive", "macro"):
+                    continue
+                if known is not None and x["k"] not in known:
+                    close = difflib.get_close_matches(x["k"], known, n=3, cutoff=0.6)
+                    issues.append(("WARN" if close else "INFO", loc(x), "geometry",
+                                   f"geometry '{e['k']}' ({g['name']}): parameter "
+                                   f"'{x['k']}' is not documented for this type"
+                                   + (f" (did you mean: {', '.join(close)}?)" if close else "")))
+            for t in g["tables"]:
+                for r in t["rows"]:
+                    if r["reqd"] == "yes" and r["name"] not in ch and r["name"] != "type":
+                        alt = {"min": "span", "max": "span"}.get(r["name"])
+                        if alt and alt in ch:
+                            continue
+                        issues.append(("ERROR", loc(e), "geometry",
+                                       f"geometry '{e['k']}' ({g['name']}): mandatory "
+                                       f"parameter '{r['name']}' is missing"))
+            # surface files
+            if not dict_only and ("TriSurfaceMesh" in g["class"]
+                                  or g["class"] == "triSurfaceMesh"):
+                fname = ch.get("file", {}).get("v", e["k"]).strip('"')
+                if not any((dd / fname).is_file() or (dd / (fname + ".gz")).is_file()
+                           for dd in surface_dirs(case)):
+                    issues.append(("WARN", loc(e), "file",
+                                   f"surface file '{fname}' not found in constant/triSurface "
+                                   "(or constant/geometry)"))
+    if cmc:
+        cd = {x["k"]: x for x in cmc["ch"]}
+        for sect in ("refinementSurfaces", "refinementRegions", "limitRegions"):
+            s = cd.get(sect)
+            if not s or s["t"] != "dict" or not geom:
+                continue
+            for x in s["ch"]:
+                if x["t"] != "dict":
+                    continue
+                if x["k"] not in gnames and not re.search(r"[|.*()]", x["k"]):
+                    close = difflib.get_close_matches(x["k"], list(gnames), n=3, cutoff=0.5)
+                    issues.append(("WARN", loc(x), "geometry",
+                                   f"{sect}: '{x['k']}' is not a geometry name, so it is "
+                                   f"not used (names: {', '.join(gnames) or '-'})"
+                                   + (f" - did you mean {close[0]}?" if close else "")))
+        feats = cd.get("features")
+        if feats and not dict_only:
+            for item in feats.get("items", []):
+                fe = {x["k"]: x for x in item}
+                if "file" in fe:
+                    fn = fe["file"]["v"].strip('"')
+                    if fn.startswith("$"):
+                        continue
+                    dirs = surface_dirs(case) + [case / "constant" / "extendedFeatureEdgeMesh"]
+                    if not any((dd / fn).is_file() or (dd / (fn + ".gz")).is_file()
+                               for dd in dirs):
+                        issues.append(("WARN", loc(fe["file"]), "file",
+                                       f"feature file '{fn}' not found; create it with "
+                                       "surfaceFeatureExtract (system/surfaceFeatureExtractDict)"))
+        # locationInMesh inside the background mesh
+        if not dict_only:
+            bb = blockmesh_bounds(case)
+            pts = []
+            if "locationInMesh" in cd:
+                pts.append((cd["locationInMesh"], cd["locationInMesh"]["v"]))
+            if "locationsInMesh" in cd:
+                for m in re.finditer(r"\(\s*([-+\d.eE]+\s+[-+\d.eE]+\s+[-+\d.eE]+)\s*\)",
+                                     cd["locationsInMesh"]["v"]):
+                    pts.append((cd["locationsInMesh"], "(" + m.group(1) + ")"))
+            for e, v in pts:
+                m = re.fullmatch(r"\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)", v.strip())
+                if not m or not bb:
+                    continue
+                p = [float(x) for x in m.groups()]
+                if not all(bb[0][i] < p[i] < bb[1][i] for i in range(3)):
+                    issues.append(("ERROR", loc(e), "location",
+                                   f"location {v} is outside the blockMesh bounds "
+                                   f"({' '.join(f'{x:g}' for x in bb[0])}) - "
+                                   f"({' '.join(f'{x:g}' for x in bb[1])})"))
+    # switches
+    for sw, sect in (("addLayers", ALC),):
+        e = next((x for x in entries if x["k"] == sw), None)
+        if e and e.get("v") in ("true", "on", "yes", "1"):
+            a = d.get(ALC)
+            if a:
+                lay = next((x for x in a["ch"] if x["k"] == "layers"), None)
+                if lay is not None and lay["t"] == "dict" and not lay["ch"]:
+                    issues.append(("WARN", loc(lay), "layers",
+                                   "addLayers is true but addLayersControls/layers is empty"))
+    return issues
+
+
+def cmd_check(args):
+    db = load_db()
+    root = project_dir(args.src, required=False)
+    p = Path(args.case).resolve()
+    if p.is_dir():
+        case = p
+        f = p / "system" / "snappyHexMeshDict"
+    else:
+        f = p
+        case = p.parent.parent if p.parent.name == "system" else p.parent
+    if not f.is_file():
+        sys.exit(f"Error: {f} not found.")
+    entries, notes = load_with_includes(f, case, root)
+    issues = check_entries(db, entries, case, root, dict_only=args.dict_only, notes=notes)
+    if args.quiet:
+        issues = [i for i in issues if i[0] != "INFO"]
+    colors = {"ERROR": "1;31", "WARN": "1;33", "INFO": "36"}
+    print(c(f"Checking {f}", "1"))
+    for lvl, where, cat, msg in issues:
+        print(f"  {c(lvl.ljust(5), colors[lvl])} {where:<28} [{cat}] {msg}")
+    ne = sum(1 for i in issues if i[0] == "ERROR")
+    nw = sum(1 for i in issues if i[0] == "WARN")
+    if not issues:
+        print("  OK: no problems found.")
+    else:
+        print(f"  {ne} error(s), {nw} warning(s)")
+    if root:
+        print(c("Tip:", "2"), "also run 'foamDictionary system/snappyHexMeshDict -expand' "
+              "and 'snappyHexMesh -dry-run' for a full check.")
+    sys.exit(1 if ne else 0)
+
+
+# ---------------------------------------------------------------------------
+# html
+# ---------------------------------------------------------------------------
+
+def cmd_html(args):
+    db = load_db()
+    if not HTML_TEMPLATE.is_file():
+        sys.exit(f"Error: template {HTML_TEMPLATE} not found")
+    opts = argparse.Namespace(level=[2, 3], layers=3, features=True, zone=set(),
+                              location=None, bounds_note="", include_quality=False)
+    db["template"] = FOAM_BANNER.format(ver=db["version"]) + "\n" + build_template(
+        db, ["<surface>.stl"], [("box", "refineBox")], opts) + FOAM_FOOTER
+    data = json.dumps(db, ensure_ascii=False).replace("</", "<\\/")
+    page = read_text(HTML_TEMPLATE).replace("/*__SHM_DATA__*/null", data)
+    out = Path(args.output) if args.output else HTML_FILE
+    out.write_text(page, encoding="utf-8")
+    print(f"Wrote {out}")
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="foamSHM", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("build", help="scan OpenFOAM sources and build the database")
+    s.add_argument("--src", help="OpenFOAM source root (default: $WM_PROJECT_DIR)")
+    s.add_argument("-o", "--output",
+                   help="database file (default: ~/.local/share/foamSHM/shmDatabase-<version>.json)")
+    s.add_argument("-v", "--verbose", action="store_true",
+                   help="list keywords found only in one source (for review)")
+    s.set_defaults(func=cmd_build)
+
+    s = sub.add_parser("tree", help="show the dictionary structure")
+    s.add_argument("path", nargs="?", help="start at this section, e.g. addLayersControls")
+    s.add_argument("-a", "--all", action="store_true",
+                   help="also show tutorial-only entries and free sub-dictionaries")
+    s.add_argument("-d", "--desc", action="store_true", help="show short descriptions")
+    s.add_argument("--depth", type=int, help="maximum depth")
+    s.set_defaults(func=cmd_tree)
+
+    s = sub.add_parser("search", help="search keywords/descriptions (all words must match)")
+    s.add_argument("keywords", nargs="+")
+    s.add_argument("-m", "--max", type=int, default=25)
+    s.set_defaults(func=cmd_search)
+
+    s = sub.add_parser("show", help="show a keyword (path or name) or a geometry type")
+    s.add_argument("name")
+    s.add_argument("-m", "--max", type=int, default=5, help="max tutorial references")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("example", help="print usage taken from the tutorials")
+    s.add_argument("name")
+    s.add_argument("-m", "--max", type=int, default=3)
+    s.add_argument("--src", help="OpenFOAM root (default: $WM_PROJECT_DIR)")
+    s.set_defaults(func=cmd_example)
+
+    s = sub.add_parser("template", help="generate a snappyHexMeshDict")
+    s.add_argument("-case", "--case", default=".", help="case directory (default: cwd)")
+    s.add_argument("--stl", action="append",
+                   help="surface file in constant/triSurface (repeatable; default: all found)")
+    s.add_argument("--shape", action="append",
+                   help="analytic refinement region <type>:<name>, e.g. box:refineBox (repeatable)")
+    s.add_argument("--level", type=int, nargs=2, default=[2, 3], metavar=("MIN", "MAX"),
+                   help="surface refinement level (default: 2 3)")
+    s.add_argument("--layers", type=int, default=0, metavar="N",
+                   help="add N boundary layers on the surfaces (sets addLayers true)")
+    s.add_argument("--features", action="store_true",
+                   help="explicit feature edge refinement/snapping (<surface>.eMesh)")
+    s.add_argument("--zone", action="append",
+                   help="make faceZone/cellZone from this surface (base name, repeatable)")
+    s.add_argument("--location", help="locationInMesh, e.g. '(0.1 0.2 0.3)'")
+    s.add_argument("--include-quality", action="store_true",
+                   help="use #include \"meshQualityDict\" instead of inline values")
+    s.add_argument("--write", action="store_true",
+                   help="write <case>/system/snappyHexMeshDict (backup .bak)")
+    s.set_defaults(func=cmd_template)
+
+    s = sub.add_parser("check", help="check a snappyHexMeshDict")
+    s.add_argument("case", nargs="?", default=".", help="case directory or dictionary file")
+    s.add_argument("--dict-only", action="store_true",
+                   help="only check the dictionary (no surface files / blockMesh)")
+    s.add_argument("-q", "--quiet", action="store_true", help="hide INFO messages")
+    s.add_argument("--src", help="OpenFOAM root for #includeEtc (default: $WM_PROJECT_DIR)")
+    s.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("html", help="generate catalog.html")
+    s.add_argument("-o", "--output")
+    s.set_defaults(func=cmd_html)
+
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        pass
+
+
+if __name__ == "__main__":
+    main()

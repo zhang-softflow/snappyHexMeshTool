@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>snappyHexMeshDict Reference</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --text: #1f2328; --muted: #6a737d;
+  --border: #e1e4e8; --accent: #0b6e99; --accent-bg: #e6f3f8;
+  --req: #c0392b; --cond: #b7791f; --code-bg: #f3f4f6; --chip: #eef1f4; --sel: #dbeef6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #15171a; --panel: #1d2024; --text: #e6e6e6; --muted: #9aa4ae;
+    --border: #2d3238; --accent: #5cc3ec; --accent-bg: #173340;
+    --req: #ff7b6b; --cond: #e0b050; --code-bg: #121416; --chip: #262a2f; --sel: #1f3a47;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #15171a; --panel: #1d2024; --text: #e6e6e6; --muted: #9aa4ae;
+  --border: #2d3238; --accent: #5cc3ec; --accent-bg: #173340;
+  --req: #ff7b6b; --cond: #e0b050; --code-bg: #121416; --chip: #262a2f; --sel: #1f3a47;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+code, pre, .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 12.5px; }
+header { display: flex; align-items: center; gap: 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--border); background: var(--panel); }
+header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+header .meta { color: var(--muted); font-size: 12px; }
+header button { margin-left: auto; }
+button { background: var(--chip); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 3px 9px; cursor: pointer; font: inherit; font-size: 12px; }
+button:hover { border-color: var(--accent); }
+.layout { display: grid; grid-template-columns: 380px 1fr; height: calc(100% - 49px); }
+aside { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+.controls { padding: 10px; border-bottom: 1px solid var(--border); }
+#q { width: 100%; padding: 7px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg); color: var(--text); font: inherit; }
+#q:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.chip { font-size: 11.5px; padding: 1px 8px; border-radius: 10px; }
+.chip.on { background: var(--accent); color: var(--panel); border-color: var(--accent); }
+.opts { margin-top: 6px; font-size: 12px; color: var(--muted); display: flex; gap: 12px; flex-wrap: wrap; }
+#list { overflow-y: auto; flex: 1; margin: 0; padding: 0; list-style: none; }
+#list li { padding: 4px 12px; border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#list li:hover { background: var(--accent-bg); }
+#list li.sel { background: var(--sel); }
+#list .n { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12.5px; }
+#list .n.dict { font-weight: 600; }
+#list .p { color: var(--muted); font-size: 11px; display: block; overflow: hidden; text-overflow: ellipsis; }
+#list .d { color: var(--muted); font-size: 11.5px; margin-left: 6px; }
+.flag { display: inline-block; width: 14px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; font-weight: 700; }
+.flag.R { color: var(--req); } .flag.C { color: var(--cond); } .flag.o { color: var(--muted); }
+.badge { font-size: 10.5px; padding: 0 6px; border-radius: 4px; background: var(--chip);
+  color: var(--muted); margin-right: 4px; }
+.badge.R { color: var(--req); } .badge.C { color: var(--cond); }
+.count { padding: 6px 12px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); }
+main { overflow-y: auto; padding: 20px 28px 60px; min-width: 0; }
+main h2 { margin: 0 0 6px; font-size: 20px; font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
+main h3 { font-size: 13px; margin: 22px 0 8px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.sub { color: var(--muted); font-size: 12.5px; }
+.desc { white-space: pre-wrap; }
+.codebox { position: relative; }
+.codebox pre { background: var(--code-bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 14px; overflow-x: auto; margin: 0; }
+.codebox button { position: absolute; top: 6px; right: 6px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+td.k { font-family: ui-monospace, Menlo, Consolas, monospace; white-space: nowrap; }
+td.k a { color: inherit; text-decoration: none; border-bottom: 1px dotted var(--muted); cursor: pointer; }
+tr.R td.k { color: var(--req); font-weight: 600; }
+.tablewrap { overflow-x: auto; }
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0 0; }
+dl.kv dt { color: var(--muted); font-size: 12.5px; }
+dl.kv dd { margin: 0; }
+ul.refs { margin: 0; padding-left: 18px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+.empty { color: var(--muted); margin-top: 40px; }
+.legend { color: var(--muted); font-size: 12px; }
+@media (max-width: 760px) {
+  .layout { grid-template-columns: 1fr; height: auto; }
+  aside { max-height: 45vh; }
+  main { padding: 16px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>snappyHexMeshDict</h1>
+  <span class="meta" id="meta"></span>
+  <button id="theme" title="Toggle theme">Theme</button>
+</header>
+<div class="layout">
+  <aside>
+    <div class="controls">
+      <input id="q" type="search" placeholder="Search keyword, description... (/)" autocomplete="off">
+      <div class="chips" id="chips"></div>
+      <div class="opts">
+        <label><input type="checkbox" id="optR"> mandatory only</label>
+        <label><input type="checkbox" id="optT"> used in tutorials</label>
+        <label><input type="checkbox" id="optD"> descriptions</label>
+      </div>
+    </div>
+    <ul id="list"></ul>
+    <div class="count" id="count"></div>
+  </aside>
+  <main id="detail"></main>
+</div>
+<script>
+const DB = /*__SHM_DATA__*/null;
+const KW = DB.keywords;
+const GEOM = DB.geometry;
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+const FLAG = {yes: "R", cond: "C", no: "o"};
+const REQ = {yes: "mandatory", cond: "conditional", no: "optional", "": "not read directly"};
+let section = "All", current = null;
+
+const nKw = Object.values(KW).filter(k => k.kind === "value").length;
+document.getElementById("meta").textContent =
+  `${DB.version} · ${nKw} keywords · ${Object.keys(GEOM).length} geometry types · ${DB.tutorialFiles.length} tutorial dictionaries · built ${DB.built}`;
+
+// Theme toggle (per-viewer convenience only)
+const root = document.documentElement;
+try { const t = localStorage.getItem("shmTheme"); if (t) root.dataset.theme = t; } catch (e) {}
+document.getElementById("theme").onclick = () => {
+  const dark = root.dataset.theme ? root.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("shmTheme", root.dataset.theme); } catch (e) {}
+};
+
+// Children, ordered like the annotated dictionary
+const kids = {};
+Object.values(KW).forEach(k => (kids[k.parent] = kids[k.parent] || []).push(k));
+const ord = k => [k.annotated ? 0 : 1, k.annotated ? k.annotated.line : 0, k.key.toLowerCase()];
+const cmp = (a, b) => { const x = ord(a), y = ord(b);
+  for (let i = 0; i < 3; i++) { if (x[i] < y[i]) return -1; if (x[i] > y[i]) return 1; } return 0; };
+Object.values(kids).forEach(l => l.sort(cmp));
+
+function hidden(k) { return k.free || (!k.req && k.kind === "value" && !k.annotated); }
+function treeOrder() {
+  const out = [];
+  (function rec(p, d) { (kids[p] || []).forEach(k => { if (hidden(k)) return; out.push([k, d]); rec(k.path, d + 1); }); })("", 0);
+  return out;
+}
+const TREE = treeOrder();
+
+// Search haystack: own text + aliases of the parents
+Object.values(KW).forEach(k => {
+  const parts = k.path.split("/");
+  let inh = "";
+  for (let i = 1; i < parts.length; i++) inh += " " + ((KW[parts.slice(0, i).join("/")] || {}).aliases || "");
+  k._hay = [k.path, k.desc, k.note, k.aliases || "", inh, k.choices.join(" ")].join(" ").toLowerCase();
+});
+Object.values(GEOM).forEach(g => g._hay = [g.names.join(" "), g.description, g.aliases,
+  g.tables.flatMap(t => t.rows.map(r => r.name + " " + r.desc)).join(" ")].join(" ").toLowerCase());
+
+const SECTIONS = ["All", "top level", ...DB.topSections, "geometry types", "template"];
+const chips = document.getElementById("chips");
+SECTIONS.forEach(s => {
+  const b = document.createElement("button");
+  b.className = "chip" + (s === section ? " on" : ""); b.textContent = s;
+  b.onclick = () => { section = s; [...chips.children].forEach(c => c.classList.toggle("on", c === b));
+    if (s === "template") showTemplate(); render(); };
+  chips.appendChild(b);
+});
+
+function inSection(k) {
+  if (section === "All") return true;
+  if (section === "top level") return !k.parent;
+  return k.path === section || k.path.startsWith(section + "/");
+}
+
+function render() {
+  const q = document.getElementById("q").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const onlyR = document.getElementById("optR").checked;
+  const onlyT = document.getElementById("optT").checked;
+  const showD = document.getElementById("optD").checked;
+  const list = document.getElementById("list");
+  list.innerHTML = "";
+  let n = 0;
+  const add = (html, title, onclick, sel) => {
+    const li = document.createElement("li");
+    li.innerHTML = html; li.title = title; li.onclick = onclick;
+    if (sel) li.className = "sel";
+    list.appendChild(li); n++;
+  };
+  if (section === "geometry types" || section === "template") {
+    Object.values(GEOM).filter(g => q.every(w => g._hay.includes(w)) && (!onlyT || g.tutorials))
+      .forEach(g => add(`<span class="n dict">${esc(g.name)}</span><span class="d">${esc(g.summary)}</span>`,
+        g.summary, () => showGeom(g.name), current === "g:" + g.name));
+  } else if (q.length) {
+    const hits = Object.values(KW).filter(k => !k.key.startsWith("<") && k.key !== "{}" && inSection(k)
+      && q.every(w => k._hay.includes(w)) && (!onlyR || k.req === "yes") && (!onlyT || k.tutorials));
+    hits.sort((a, b) => score(b, q) - score(a, q));
+    hits.forEach(k => add(`<span class="flag ${FLAG[k.req] || ""}">${FLAG[k.req] || ""}</span><span class="n">${esc(k.key)}</span>`
+      + `<span class="p">${esc(k.parent || "top level")}</span>`, k.path, () => showKw(k.path), current === k.path));
+    Object.values(GEOM).filter(g => section === "All" && q.every(w => g._hay.includes(w)))
+      .forEach(g => add(`<span class="flag"></span><span class="n dict">${esc(g.name)}</span><span class="p">geometry type</span>`,
+        g.summary, () => showGeom(g.name), current === "g:" + g.name));
+  } else {
+    TREE.filter(([k]) => inSection(k) && (!onlyR || k.req === "yes" || k.kind !== "value") && (!onlyT || k.tutorials))
+      .forEach(([k, d]) => {
+        const isDict = k.kind !== "value";
+        const dsc = showD && !isDict ? `<span class="d">${esc(short(k))}</span>` : "";
+        const dflt = k.default ? `<span class="d">= ${esc(k.default)}</span>` : "";
+        add(`<span style="padding-left:${d * 14}px"></span><span class="flag ${FLAG[k.req] || ""}">${FLAG[k.req] || ""}</span>`
+          + `<span class="n${isDict ? " dict" : ""}">${esc(k.key)}${isDict ? "/" : ""}</span>${dflt}${dsc}`,
+          k.path, () => showKw(k.path), current === k.path);
+      });
+  }
+  document.getElementById("count").textContent = `${n} shown · R mandatory · C conditional · o optional`;
+}
+function score(k, q) {
+  return q.reduce((s, w) => s + (k.key.toLowerCase().includes(w) ? 5 : 0) + ((k.aliases || "").toLowerCase().includes(w) ? 3 : 0), 0)
+    + (k.req === "yes" ? 2 : 0) + (k.tutorials ? 1 : 0);
+}
+function short(k) {
+  let d = (k.desc || k.note || "").replace(/\s+/g, " ").trim();
+  return d.length > 70 ? d.slice(0, 67) + "..." : d;
+}
+function tutName(fi) {
+  return DB.tutorialFiles[fi].replace(/^tutorials\//, "").replace(/\/system\/snappyHexMeshDict$/, "");
+}
+
+// Snippet showing where the keyword goes
+function exampleValue(k) {
+  if (k.annotated && k.annotated.value) return k.annotated.value;
+  const ex = (k.examples || []).find(x => x[2] !== "{...}");
+  if (ex) return ex[2];
+  if (k.default) return k.default.replace(/ \(.*\)$/, "");
+  if (k.choices.length) return k.choices[0];
+  return "<value>";
+}
+function snippet(k) {
+  const parts = k.path.split("/");
+  const lines = [];
+  let ind = "";
+  const close = [];
+  for (let i = 0; i < parts.length - 1; i++) {
+    const p = parts[i];
+    if (p === "{}") { lines.push(ind + "{"); close.push(ind + "}"); ind += "    "; continue; }
+    const path = parts.slice(0, i + 1).join("/");
+    if ((DB.listDicts || []).includes(path)) { lines.push(ind + p); lines.push(ind + "("); close.push(ind + ");"); ind += "    "; continue; }
+    lines.push(ind + p); lines.push(ind + "{"); close.push(ind + "}"); ind += "    ";
+  }
+  const last = parts[parts.length - 1];
+  if (k.kind === "value") lines.push(ind + last + " " + exampleValue(k) + ";");
+  else if (k.kind === "list") { lines.push(ind + last); lines.push(ind + "("); lines.push(ind + ");"); }
+  else { lines.push(ind + last); lines.push(ind + "{"); lines.push(ind + "}"); }
+  while (close.length) lines.push(close.pop());
+  return lines.join("\n");
+}
+function codebox(text) {
+  const id = "c" + Math.random().toString(36).slice(2);
+  setTimeout(() => { const b = document.getElementById(id); if (b) b.onclick = () => copy(text, b); }, 0);
+  return `<div class="codebox"><pre>${esc(text)}</pre><button id="${id}">Copy</button></div>`;
+}
+function copy(text, b) {
+  const done = () => { b.textContent = "Copied"; setTimeout(() => b.textContent = "Copy", 1200); };
+  if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, () => fallback(text, done));
+  else fallback(text, done);
+}
+function fallback(text, done) {
+  const t = document.createElement("textarea"); t.value = text; document.body.appendChild(t);
+  t.select(); try { document.execCommand("copy"); done(); } catch (e) {} t.remove();
+}
+function crumb(path) {
+  const parts = path.split("/");
+  return parts.map((p, i) => i === parts.length - 1 ? esc(p)
+    : `<a data-p="${esc(parts.slice(0, i + 1).join("/"))}">${esc(p)}</a>`).join(" / ");
+}
+function wire(el) {
+  el.querySelectorAll("a[data-p]").forEach(a => a.onclick = () => showKw(a.dataset.p));
+  el.querySelectorAll("a[data-g]").forEach(a => a.onclick = () => showGeom(a.dataset.g));
+}
+function whenText(k) {
+  const w = k.when || [], out = [];
+  if (w.includes("addLayers")) out.push("only read when addLayers is true");
+  if (w.includes("snapOrLayers")) out.push("only read when snap or addLayers is true");
+  if (w.includes("medialAxis")) out.push("only for the default meshShrinker displacementMedialAxis");
+  return out.join("; ");
+}
+
+function showKw(path) {
+  const k = KW[path]; if (!k) return;
+  current = path;
+  let h = `<div class="crumb sub">${crumb(path)}</div><h2>${esc(k.key)}</h2>`;
+  h += `<span class="badge ${FLAG[k.req] || ""}">${REQ[k.req]}</span>`;
+  h += `<span class="badge">${esc({named: "named entries", list: "list of dictionaries"}[k.kind] || k.kind)}${k.type ? " · " + esc(k.type) : ""}</span>`;
+  if (k.tutorials) h += `<span class="badge">${k.tutorials} tutorial file(s)</span>`;
+  h += `<dl class="kv">`;
+  if (k.default) h += `<dt>default</dt><dd class="mono">${esc(k.default)}</dd>`;
+  if (k.choices.length) h += `<dt>choices</dt><dd class="mono">${k.choices.map(esc).join(" | ")}</dd>`;
+  if (k.note) h += `<dt>note</dt><dd>${esc(k.note)}</dd>`;
+  if ((k.req === "yes" || k.req === "cond") && whenText(k)) h += `<dt>when</dt><dd>${esc(whenText(k))}</dd>`;
+  if (k.cfg) h += `<dt>etc cfg</dt><dd class="mono">${esc(k.key)} ${esc(k.cfg.value)};  <span class="sub">(${esc(k.cfg.file)})</span></dd>`;
+  h += `</dl>`;
+  if (k.desc) h += `<h3>Description${k.borrowed ? " (from " + esc(k.borrowed) + ")" : ""}</h3><div class="desc">${esc(k.desc)}</div>`;
+  h += `<h3>Where it goes</h3>` + codebox(snippet(k));
+  if (k.annotated) {
+    const a = k.annotated;
+    const vals = [a.value, ...(a.alternatives || [])].filter(Boolean);
+    if (vals.length) {
+      h += `<h3>Annotated example${a.commented ? " (commented out = optional)" : ""}</h3>`;
+      h += `<pre class="codebox"><code>${vals.map(v => esc(k.key + " " + v + ";")).join("\n")}</code></pre>`;
+      h += `<div class="sub">${esc(a.file)}:${a.line}</div>`;
+    }
+  }
+  const ch = (kids[path] || []).filter(x => !x.free);
+  if (ch.length) {
+    h += `<h3>Entries</h3><div class="tablewrap"><table><tr><th>keyword</th><th>required</th><th>default</th><th>description</th></tr>`;
+    ch.forEach(x => h += `<tr class="${FLAG[x.req] || ""}"><td class="k"><a data-p="${esc(x.path)}">${esc(x.key)}${x.kind !== "value" ? "/" : ""}</a></td>`
+      + `<td>${REQ[x.req]}</td><td class="mono">${esc(x.default)}</td><td>${esc(short(x))}</td></tr>`);
+    h += `</table></div>`;
+  }
+  if (path === "geometry" || path === "geometry/<geometry>" || path === "geometry/<geometry>/type") {
+    h += `<h3>Geometry types</h3><p>` + Object.values(GEOM).map(g => `<a data-g="${esc(g.name)}" class="mono" style="cursor:pointer;color:var(--accent)">${esc(g.name)}</a>`).join(" · ") + `</p>`;
+  }
+  if (k.examples && k.examples.length) {
+    h += `<h3>Tutorials</h3><ul class="refs">`;
+    const seen = new Set();
+    k.examples.forEach(([fi, ln, v]) => { if (seen.has(fi) || seen.size >= 12) return; seen.add(fi);
+      h += `<li>${esc(tutName(fi))}:${ln}${v !== "{...}" ? "  →  " + esc(k.key + " " + v + ";") : ""}</li>`; });
+    h += `</ul>`;
+  }
+  if (k.src.length) h += `<h3>Read in</h3><ul class="refs">${k.src.map(s => `<li>${esc(s)}</li>`).join("")}</ul>`;
+  const d = document.getElementById("detail");
+  d.innerHTML = h; wire(d); d.scrollTop = 0;
+  render();
+}
+
+function showGeom(name) {
+  const g = GEOM[name]; if (!g) return;
+  current = "g:" + name;
+  let h = `<div class="crumb sub"><a data-p="geometry">geometry</a> / type</div><h2>${esc(g.name)}</h2>`;
+  if (g.names.length > 1) h += `<span class="badge">also: ${esc(g.names.filter(n => n !== g.name).join(", "))}</span>`;
+  h += `<span class="badge">${g.tutorials} use(s) in tutorials</span>`;
+  if (g.description) h += `<h3>Description</h3><div class="desc">${esc(g.description)}</div>`;
+  g.tables.forEach(t => {
+    h += `<h3>Parameters${t.heading ? " (" + esc(t.heading) + ")" : ""}</h3><div class="tablewrap"><table><tr><th>keyword</th><th>required</th><th>description</th><th>default</th></tr>`;
+    t.rows.forEach(r => h += `<tr class="${r.reqd === "yes" ? "R" : ""}"><td class="k">${esc(r.name)}</td><td>${esc(r.reqd)}</td><td>${esc(r.desc)}</td><td class="mono">${esc(r.default)}</td></tr>`);
+    h += `</table></div>`;
+  });
+  // ready-to-copy entry
+  const rows = g.tables.flatMap(t => t.rows).filter(r => r.reqd === "yes" && r.name !== "type");
+  let entry = `geometry\n{\n    my${g.name[0].toUpperCase() + g.name.slice(1)}\n    {\n        type ${g.name};\n`;
+  rows.forEach(r => entry += `        ${r.name.padEnd(8)} <${r.name}>;\n`);
+  entry += `    }\n}`;
+  h += `<h3>Entry</h3>` + codebox(entry);
+  if (g.note) h += `<h3>Note</h3><div class="desc">${esc(g.note)}</div>`;
+  g.verbatims.slice(0, 2).forEach(v => h += `<h3>Example (header)</h3>` + codebox(v));
+  const ks = Object.entries(g.keys).sort((a, b) => b[1] - a[1]);
+  if (ks.length) h += `<h3>Parameters used in tutorials</h3><p class="mono">${ks.map(([k, n]) => esc(k) + " (" + n + ")").join(", ")}</p>`;
+  if (g.examples.length) {
+    h += `<h3>Tutorials</h3><ul class="refs">`;
+    const seen = new Set();
+    g.examples.forEach(([fi, ln]) => { if (seen.has(fi) || seen.size >= 12) return; seen.add(fi); h += `<li>${esc(tutName(fi))}:${ln}</li>`; });
+    h += `</ul>`;
+  }
+  h += `<p class="sub">Header: ${esc(g.header)}</p>`;
+  const d = document.getElementById("detail");
+  d.innerHTML = h; wire(d); d.scrollTop = 0;
+  render();
+}
+
+function showTemplate() {
+  current = null;
+  const d = document.getElementById("detail");
+  d.innerHTML = `<h2>Template</h2><p class="sub">A complete snappyHexMeshDict with surface refinement, a refinement box, feature edges and 3 boundary layers.
+    Replace the &lt;...&gt; placeholders. The command line tool does the same for your case:
+    <code>foamSHM template -case . --layers 3 --features --shape box:refineBox --write</code>, then <code>foamSHM check .</code></p>` + codebox(DB.template || "");
+}
+
+function intro() {
+  document.getElementById("detail").innerHTML = `<h2>snappyHexMeshDict reference</h2>
+  <p>Every keyword of <code>system/snappyHexMeshDict</code>, collected from the annotated dictionary
+  (<code>etc/caseDicts/annotated/snappyHexMeshDict</code>), the C++ sources that read it (mandatory/optional and defaults),
+  and the ${DB.tutorialFiles.length} tutorial dictionaries.</p>
+  <p class="legend"><b class="flag R">R</b> mandatory · <b class="flag C">C</b> conditional · <b class="flag o">o</b> optional (default shown) ·
+  user-chosen names are written as <code>&lt;surface&gt;</code>, <code>&lt;patch&gt;</code> ...</p>
+  <p>Start from a section on the left, search (English or Japanese, e.g. <code>layer thickness</code>, <code>境界層</code>, <code>隙間</code>),
+  look at the <a style="cursor:pointer;color:var(--accent)" id="gt">geometry types</a>, or copy the <a style="cursor:pointer;color:var(--accent)" id="tp">template</a>.</p>`;
+  document.getElementById("gt").onclick = () => chips.children[SECTIONS.indexOf("geometry types")].click();
+  document.getElementById("tp").onclick = () => chips.children[SECTIONS.indexOf("template")].click();
+}
+
+document.getElementById("q").oninput = render;
+["optR", "optT", "optD"].forEach(id => document.getElementById(id).onchange = render);
+document.addEventListener("keydown", e => {
+  if (e.key === "/" && document.activeElement.id !== "q") { e.preventDefault(); document.getElementById("q").focus(); }
+});
+function fromHash() {
+  const h = decodeURIComponent(location.hash.slice(1));
+  if (!h) return false;
+  if (KW[h]) { showKw(h); return true; }
+  const g = Object.values(GEOM).find(x => x.names.includes(h));
+  if (g) { showGeom(g.name); return true; }
+  const k = Object.values(KW).find(x => x.key === h || x.path.endsWith("/" + h));
+  if (k) { showKw(k.path); return true; }
+  return false;
+}
+window.addEventListener("hashchange", fromHash);
+if (!fromHash()) intro();
+render();
+</script>
+</body>
+</html>
